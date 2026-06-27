@@ -16,12 +16,12 @@ pub struct AudioCapture {
     config: cpal::StreamConfig,
     ring_buffer: Arc<AsyncMutex<AllocRingBuffer<f32>>>,
     running: Arc<AtomicBool>,
-    level_tx: Option<mpsc::UnboundedSender<f32>>,
+    level_tx: mpsc::UnboundedSender<f32>,
     stream_handle: Option<cpal::Stream>,
 }
 
 impl AudioCapture {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(level_tx: mpsc::UnboundedSender<f32>) -> Result<Self, String> {
         let host = cpal::default_host();
         let _device = host
             .default_input_device()
@@ -40,13 +40,9 @@ impl AudioCapture {
             config,
             ring_buffer,
             running: Arc::new(AtomicBool::new(false)),
-            level_tx: None,
+            level_tx,
             stream_handle: None,
         })
-    }
-
-    pub fn set_level_sender(&mut self, tx: mpsc::UnboundedSender<f32>) {
-        self.level_tx = Some(tx);
     }
 
     pub fn start(&mut self) -> Result<(), String> {
@@ -75,9 +71,7 @@ impl AudioCapture {
                         let _ = rb.push(value);
                         drop(rb);
 
-                        if let Some(ref tx) = level_tx {
-                            let _ = tx.send((value.abs() * 100.0) as f32);
-                        }
+                        let _ = level_tx.send((value.abs() * 100.0) as f32);
                     }
                 },
                 err_fn,
