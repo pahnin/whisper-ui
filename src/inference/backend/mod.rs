@@ -55,6 +55,7 @@ pub trait TranscriptionBackend: Send + 'static {
     ) -> Result<TranscriptSegment, Self::Error>;
 
     fn supported_languages(&self) -> Vec<String>;
+    fn language_codes(&self) -> Vec<String>;
     fn is_ready(&self) -> bool;
 }
 

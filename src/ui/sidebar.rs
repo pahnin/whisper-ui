@@ -1,4 +1,4 @@
-use iced::widget::{button, column, Column, Container, Scrollable, Text};
+use iced::widget::{button, column, Column, Container, Scrollable, Text, TextInput};
 use iced::{Element, Length};
 
 use crate::app::Message;
@@ -7,6 +7,8 @@ use crate::workspace::Workspace;
 pub fn view<'a>(
     workspace: &'a Workspace,
     active_id: Option<uuid::Uuid>,
+    rename_doc: Option<uuid::Uuid>,
+    rename_input: &'a str,
 ) -> Element<'a, Message> {
     let mut doc_items = Column::new()
         .spacing(4)
@@ -17,16 +19,42 @@ pub fn view<'a>(
 
     for (_, doc) in &workspace.documents {
         let is_active = active_id.map(|id| id == doc.id).unwrap_or(false);
-        let label = if is_active {
-            format!("▸ {}", doc.title)
-        } else {
-            format!("  {}", doc.title)
-        };
+        let is_renaming = rename_doc.map(|id| id == doc.id).unwrap_or(false);
 
-        doc_items = doc_items.push(
-            button(Text::new(label))
-                .on_press(Message::SelectDocument(doc.id)),
-        );
+        if is_renaming {
+            let item: Element<Message> = Column::new()
+                .push(
+                    TextInput::new("Rename...", &rename_input)
+                        .on_input(Message::RenameDocumentConfirm)
+                        .on_submit(Message::RenameDocumentConfirm(rename_input.to_string()))
+                        .width(180.0)
+                        .size(12),
+                )
+                .into();
+            doc_items = doc_items.push(item);
+        } else {
+            let label = if is_active {
+                format!("▸ {}", doc.title)
+            } else {
+                format!("  {}", doc.title)
+            };
+
+            let button_content = button(Text::new(label))
+                .on_press(Message::SelectDocument(doc.id));
+
+            let rename_btn = button(Text::new(" ✎"))
+                .on_press(Message::RenameDocument(doc.id));
+
+            let row: Element<Message> = Column::new()
+                .push(
+                    Column::new()
+                        .push(button_content)
+                        .push(rename_btn),
+                )
+                .into();
+
+            doc_items = doc_items.push(row);
+        }
     }
 
     let sidebar_content = column![

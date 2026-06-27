@@ -28,6 +28,60 @@ impl WhisperBackend {
             language: params.language,
         })
     }
+
+    /// Synchronous transcription — the whisper-rs pipeline is purely CPU-bound
+    /// (pcm_to_mel, encode, decode, as_iter have no I/O or await points).
+    /// This method exists so blocking threads (std::thread, spawn_blocking)
+    /// can transcribe without needing a tokio runtime.
+    pub fn transcribe_segment_sync(
+        &mut self,
+        audio_data: &[f32],
+    ) -> Result<TranscriptSegment, BackendError> {
+        if audio_data.is_empty() {
+            return Ok(TranscriptSegment {
+                text: String::new(),
+                start: Duration::ZERO,
+                end: Duration::ZERO,
+            });
+        }
+
+        let strategy = SamplingStrategy::Greedy { best_of: 1 };
+        let mut params = FullParams::new(strategy);
+        params.set_language(self.language.as_deref());
+        params.set_n_threads(4);
+
+        self.state
+            .pcm_to_mel(audio_data, 4)
+            .map_err(|e| BackendError::TranscriptionFailed(format!("pcm_to_mel: {}", e)))?;
+
+        self.state
+            .encode(0, 4)
+            .map_err(|e| BackendError::TranscriptionFailed(format!("encode: {}", e)))?;
+
+        self.state
+            .decode(&[], 0, 4)
+            .map_err(|e| BackendError::TranscriptionFailed(format!("decode: {}", e)))?;
+
+        let mut text_parts = Vec::new();
+        for segment in self.state.as_iter() {
+            text_parts.push(segment.to_str_lossy().unwrap_or_default().to_string());
+        }
+
+        let full_text = text_parts.join("\n");
+
+        let segment = TranscriptSegment {
+            text: full_text,
+            start: Duration::ZERO,
+            end: Duration::ZERO,
+        };
+
+        let new_state = self.ctx
+            .create_state()
+            .map_err(|e| BackendError::Internal(format!("Failed to reset state: {}", e)))?;
+        self.state = new_state;
+
+        Ok(segment)
+    }
 }
 
 #[async_trait]
@@ -96,6 +150,16 @@ impl TranscriptionBackend for WhisperBackend {
             }
         }
         langs
+    }
+
+    fn language_codes(&self) -> Vec<String> {
+        let mut codes = Vec::new();
+        for i in 0..=whisper_rs::get_lang_max_id() {
+            if let Some(code) = whisper_rs::get_lang_str(i) {
+                codes.push(code.to_string());
+            }
+        }
+        codes
     }
 
     fn is_ready(&self) -> bool {

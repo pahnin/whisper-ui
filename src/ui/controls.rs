@@ -10,7 +10,7 @@ pub fn view<'a>(
     backend_ready: bool,
 ) -> iced::Element<'a, Message> {
     let rec_btn = if !backend_ready {
-        button(Text::new("No Model Loaded"))
+        button(Text::new("Load Model First"))
     } else if is_recording && !is_paused {
         button(Text::new("Stop"))
             .on_press(Message::StopRecord)

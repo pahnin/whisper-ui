@@ -1,26 +1,23 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 use futures_lite::StreamExt;
 use reqwest::Client;
-use tokio::sync::{mpsc, Mutex};
+use whisper_rs;
 
 #[derive(Clone)]
 pub struct ProgressSender {
-    inner: Arc<Mutex<mpsc::UnboundedSender<f32>>>,
+    tx: Sender<f32>,
 }
 
 impl ProgressSender {
-    pub fn new(tx: mpsc::UnboundedSender<f32>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(tx)),
-        }
+    pub fn new(tx: Sender<f32>) -> Self {
+        Self { tx }
     }
 
-    pub async fn send(&self, value: f32) {
-        let sender = self.inner.lock().await;
-        let _ = sender.send(value);
+    pub fn send(&self, value: f32) {
+        let _ = self.tx.send(value);
     }
 }
 
@@ -137,7 +134,7 @@ impl ModelManager {
                 0.0
             };
 
-            progress.send(progress_pct).await;
+            progress.send(progress_pct);
         }
 
         let output_path = self.cache_dir.join(&model.filename);
@@ -147,8 +144,20 @@ impl ModelManager {
     }
 
     pub fn clone_progress_sender(&self) -> ProgressSender {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = std::sync::mpsc::channel();
         ProgressSender::new(tx)
+    }
+
+    pub fn language_options() -> Vec<(String, String)> {
+        let mut langs = Vec::new();
+        for i in 0..=whisper_rs::get_lang_max_id() {
+            if let Some(code) = whisper_rs::get_lang_str(i) {
+                if let Some(full) = whisper_rs::get_lang_str_full(i) {
+                    langs.push((code.to_string(), full.to_string()));
+                }
+            }
+        }
+        langs
     }
 
     pub fn validate(&self, idx: usize) -> Result<PathBuf, String> {
