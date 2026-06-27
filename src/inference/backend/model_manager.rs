@@ -6,6 +6,24 @@ use futures_lite::StreamExt;
 use reqwest::Client;
 use tokio::sync::{mpsc, Mutex};
 
+#[derive(Clone)]
+pub struct ProgressSender {
+    inner: Arc<Mutex<mpsc::UnboundedSender<f32>>>,
+}
+
+impl ProgressSender {
+    pub fn new(tx: mpsc::UnboundedSender<f32>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(tx)),
+        }
+    }
+
+    pub async fn send(&self, value: f32) {
+        let sender = self.inner.lock().await;
+        let _ = sender.send(value);
+    }
+}
+
 const MODEL_NAMES: &[&str] = &[
     "ggml-tiny.bin",
     "ggml-base.bin",
@@ -82,7 +100,7 @@ impl ModelManager {
     pub async fn download(
         &self,
         idx: usize,
-        progress: Arc<Mutex<mpsc::UnboundedSender<f32>>>,
+        progress: ProgressSender,
     ) -> Result<PathBuf, String> {
         let model = self
             .get_model_by_index(idx)
@@ -119,14 +137,18 @@ impl ModelManager {
                 0.0
             };
 
-            let sender = progress.lock().await;
-            let _ = sender.send(progress_pct);
+            progress.send(progress_pct).await;
         }
 
         let output_path = self.cache_dir.join(&model.filename);
         fs::write(&output_path, &buffer).map_err(|e| format!("Failed to save model: {}", e))?;
 
         Ok(output_path)
+    }
+
+    pub fn clone_progress_sender(&self) -> ProgressSender {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ProgressSender::new(tx)
     }
 
     pub fn validate(&self, idx: usize) -> Result<PathBuf, String> {

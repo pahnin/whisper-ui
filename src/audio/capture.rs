@@ -1,11 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex as AsyncMutex;
 
 const SAMPLE_RATE: u32 = 16000;
 const CHANNELS: u16 = 1;
@@ -14,14 +13,14 @@ const RING_BUFFER_CAPACITY: usize = 10;
 
 pub struct AudioCapture {
     config: cpal::StreamConfig,
-    ring_buffer: Arc<AsyncMutex<AllocRingBuffer<f32>>>,
+    ring_buffer: Arc<Mutex<AllocRingBuffer<f32>>>,
     running: Arc<AtomicBool>,
-    level_tx: mpsc::UnboundedSender<f32>,
+    level_tx: Sender<f32>,
     stream_handle: Option<cpal::Stream>,
 }
 
 impl AudioCapture {
-    pub fn new(level_tx: mpsc::UnboundedSender<f32>) -> Result<Self, String> {
+    pub fn new(level_tx: Sender<f32>) -> Result<Self, String> {
         let host = cpal::default_host();
         let _device = host
             .default_input_device()
@@ -33,8 +32,8 @@ impl AudioCapture {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let ring_buffer: Arc<AsyncMutex<AllocRingBuffer<f32>>> =
-            Arc::new(AsyncMutex::new(AllocRingBuffer::new(RING_BUFFER_CAPACITY * SAMPLE_RATE as usize)));
+        let ring_buffer: Arc<Mutex<AllocRingBuffer<f32>>> =
+            Arc::new(Mutex::new(AllocRingBuffer::new(RING_BUFFER_CAPACITY * SAMPLE_RATE as usize)));
 
         Ok(Self {
             config,
@@ -67,10 +66,9 @@ impl AudioCapture {
                 &config,
                 move |data: &[f32], _: &_| {
                     if let Some(&value) = data.first() {
-                        let mut rb = ring_buffer.blocking_lock();
-                        let _ = rb.push(value);
-                        drop(rb);
-
+                        if let Ok(mut rb) = ring_buffer.lock() {
+                            let _ = rb.push(value);
+                        }
                         let _ = level_tx.send((value.abs() * 100.0) as f32);
                     }
                 },
@@ -96,39 +94,17 @@ impl AudioCapture {
     pub fn get_audio_chunk(&self) -> Vec<f32> {
         let mut chunk = Vec::new();
         let samples = (SAMPLE_RATE as usize) * BUFFER_DURATION_SECS as usize;
-        let mut rb = self.ring_buffer.blocking_lock();
-
-        for _ in 0..samples {
-            if let Some(value) = rb.dequeue() {
-                chunk.push(value);
+        if let Ok(mut rb) = self.ring_buffer.lock() {
+            for _ in 0..samples {
+                if let Some(value) = rb.dequeue() {
+                    chunk.push(value);
+                }
             }
         }
-
         chunk
     }
 
-    pub fn get_audio_level(&self) -> f32 {
-        let mut sum = 0.0;
-        let mut count = 0u64;
-        let mut temp_values = Vec::new();
-        let mut rb = self.ring_buffer.blocking_lock();
-
-        for _ in 0..100 {
-            if let Some(value) = rb.dequeue() {
-                sum += value.abs() as f64;
-                count += 1;
-                temp_values.push(value);
-            }
-        }
-
-        for value in temp_values {
-            let _ = rb.push(value);
-        }
-
-        if count > 0 {
-            ((sum / count as f64) * 100.0) as f32
-        } else {
-            0.0
-        }
+    pub fn get_ring_buffer(&self) -> Arc<Mutex<AllocRingBuffer<f32>>> {
+        self.ring_buffer.clone()
     }
 }

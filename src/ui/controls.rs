@@ -7,8 +7,11 @@ pub fn view<'a>(
     is_recording: bool,
     is_paused: bool,
     audio_level: f32,
+    backend_ready: bool,
 ) -> iced::Element<'a, Message> {
-    let rec_btn = if is_recording && !is_paused {
+    let rec_btn = if !backend_ready {
+        button(Text::new("No Model Loaded"))
+    } else if is_recording && !is_paused {
         button(Text::new("Stop"))
             .on_press(Message::StopRecord)
     } else if is_paused {
@@ -23,10 +26,18 @@ pub fn view<'a>(
     let level_bar = "█".repeat(level)
         + &"░".repeat((10 - level).max(0));
 
+    let status_text = if !backend_ready {
+        Text::new(" ⚠ No model loaded - configure in Settings").size(12)
+    } else if is_recording && !is_paused {
+        Text::new("● REC").size(12)
+    } else {
+        Text::new(format!(" Level: {}", level_bar)).size(12)
+    };
+
     let bottom_bar = Container::new(
         Row::new()
             .push(rec_btn)
-            .push(Text::new(format!(" Level: {}", level_bar)).size(12))
+            .push(status_text)
             .spacing(16)
             .padding(8),
     );
