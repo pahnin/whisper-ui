@@ -97,7 +97,7 @@ impl ModelManager {
     pub async fn download(
         &self,
         idx: usize,
-        progress: ProgressSender,
+        progress: &ProgressSender,
     ) -> Result<PathBuf, String> {
         let model = self
             .get_model_by_index(idx)
@@ -120,7 +120,7 @@ impl ModelManager {
 
         let total_size = response.content_length().unwrap_or(model.size_bytes as u64);
         let mut downloaded: u64 = 0;
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(model.size_bytes);
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -131,14 +131,16 @@ impl ModelManager {
             let progress_pct = if total_size > 0 {
                 (downloaded as f32 / total_size as f32) * 100.0
             } else {
-                0.0
+                (downloaded as f32 / model.size_bytes as f32) * 100.0
             };
 
             progress.send(progress_pct);
         }
 
+        let temp_path = self.cache_dir.join(format!(".{}.tmp", model.filename));
+        fs::write(&temp_path, &buffer).map_err(|e| format!("Failed to save model: {}", e))?;
         let output_path = self.cache_dir.join(&model.filename);
-        fs::write(&output_path, &buffer).map_err(|e| format!("Failed to save model: {}", e))?;
+        fs::rename(&temp_path, &output_path).map_err(|e| format!("Failed to finalize model: {}", e))?;
 
         Ok(output_path)
     }

@@ -65,11 +65,19 @@ impl AudioCapture {
             .build_input_stream::<f32, _, _>(
                 &config,
                 move |data: &[f32], _: &_| {
-                    if let Some(&value) = data.first() {
+                    if !data.is_empty() {
                         if let Ok(mut rb) = ring_buffer.lock() {
-                            let _ = rb.push(value);
+                            let available = rb.capacity() - rb.len();
+                            if available > 0 {
+                                let to_push = data.len().min(available);
+                                for &value in &data[..to_push] {
+                                    let _ = rb.push(value);
+                                }
+                            }
                         }
-                        let _ = level_tx.send((value.abs() * 100.0) as f32);
+                        if let Some(&value) = data.first() {
+                            let _ = level_tx.send((value.abs() * 100.0) as f32);
+                        }
                     }
                 },
                 err_fn,
@@ -106,5 +114,9 @@ impl AudioCapture {
 
     pub fn get_ring_buffer(&self) -> Arc<Mutex<AllocRingBuffer<f32>>> {
         self.ring_buffer.clone()
+    }
+
+    pub fn get_running(&self) -> Arc<AtomicBool> {
+        self.running.clone()
     }
 }

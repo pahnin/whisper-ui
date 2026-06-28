@@ -14,14 +14,17 @@ pub struct WhisperBackend {
 
 impl WhisperBackend {
     pub fn new(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
+        eprintln!("[WHISPER] new() START - model_path={:?}", model_path);
         let whisper_params = whisper_rs::WhisperContextParameters::default();
+        eprintln!("[WHISPER] new() calling WhisperContext::new_with_params()");
         let ctx = WhisperContext::new_with_params(&model_path, whisper_params)
             .map_err(|e| BackendError::Internal(format!("Failed to load model: {}", e)))?;
-
+        eprintln!("[WHISPER] new() ctx created successfully");
+        eprintln!("[WHISPER] new() calling ctx.create_state()");
         let state = ctx
             .create_state()
             .map_err(|e| BackendError::Internal(format!("Failed to init state: {}", e)))?;
-
+        eprintln!("[WHISPER] new() state created successfully, returning WhisperBackend");
         Ok(Self {
             ctx,
             state,
@@ -29,15 +32,16 @@ impl WhisperBackend {
         })
     }
 
-    /// Synchronous transcription — the whisper-rs pipeline is purely CPU-bound
-    /// (pcm_to_mel, encode, decode, as_iter have no I/O or await points).
-    /// This method exists so blocking threads (std::thread, spawn_blocking)
-    /// can transcribe without needing a tokio runtime.
+    /// Synchronous transcription using WhisperState::full() convenience method.
+    /// The same WhisperState instance is reused across calls — no reset needed.
+    /// pcm_to_mel() on a fresh params call clears internal buffers automatically.
     pub fn transcribe_segment_sync(
         &mut self,
         audio_data: &[f32],
     ) -> Result<TranscriptSegment, BackendError> {
+        eprintln!("[WHISPER] transcribe_segment_sync() START - audio_data.len()={}", audio_data.len());
         if audio_data.is_empty() {
+            eprintln!("[WHISPER] transcribe_segment_sync() returning early (empty audio)");
             return Ok(TranscriptSegment {
                 text: String::new(),
                 start: Duration::ZERO,
@@ -50,17 +54,11 @@ impl WhisperBackend {
         params.set_language(self.language.as_deref());
         params.set_n_threads(4);
 
+        eprintln!("[WHISPER] transcribe_segment_sync() calling state.full()");
         self.state
-            .pcm_to_mel(audio_data, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("pcm_to_mel: {}", e)))?;
-
-        self.state
-            .encode(0, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("encode: {}", e)))?;
-
-        self.state
-            .decode(&[], 0, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("decode: {}", e)))?;
+            .full(params, audio_data)
+            .map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
+        eprintln!("[WHISPER] transcribe_segment_sync() state.full() done");
 
         let mut text_parts = Vec::new();
         for segment in self.state.as_iter() {
@@ -75,11 +73,7 @@ impl WhisperBackend {
             end: Duration::ZERO,
         };
 
-        let new_state = self.ctx
-            .create_state()
-            .map_err(|e| BackendError::Internal(format!("Failed to reset state: {}", e)))?;
-        self.state = new_state;
-
+        eprintln!("[WHISPER] transcribe_segment_sync() returning Ok(segment)");
         Ok(segment)
     }
 }
@@ -96,50 +90,7 @@ impl TranscriptionBackend for WhisperBackend {
         &mut self,
         audio_data: &[f32],
     ) -> Result<TranscriptSegment, Self::Error> {
-        if audio_data.is_empty() {
-            return Ok(TranscriptSegment {
-                text: String::new(),
-                start: Duration::ZERO,
-                end: Duration::ZERO,
-            });
-        }
-
-        let strategy = SamplingStrategy::Greedy { best_of: 1 };
-        let mut params = FullParams::new(strategy);
-        params.set_language(self.language.as_deref());
-        params.set_n_threads(4);
-
-        self.state
-            .pcm_to_mel(audio_data, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("pcm_to_mel: {}", e)))?;
-
-        self.state
-            .encode(0, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("encode: {}", e)))?;
-
-        self.state
-            .decode(&[], 0, 4)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("decode: {}", e)))?;
-
-        let mut text_parts = Vec::new();
-        for segment in self.state.as_iter() {
-            text_parts.push(segment.to_str_lossy().unwrap_or_default().to_string());
-        }
-
-        let full_text = text_parts.join("\n");
-
-        let segment = TranscriptSegment {
-            text: full_text,
-            start: Duration::ZERO,
-            end: Duration::ZERO,
-        };
-
-        let new_state = self.ctx
-            .create_state()
-            .map_err(|e| BackendError::Internal(format!("Failed to reset state: {}", e)))?;
-        self.state = new_state;
-
-        Ok(segment)
+        self.transcribe_segment_sync(audio_data)
     }
 
     fn supported_languages(&self) -> Vec<String> {

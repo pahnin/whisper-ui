@@ -180,12 +180,9 @@ fn build_model_list<'a>(
                     + &"\u{2591}".repeat((10 - filled.min(10)).max(0));
                 Text::new(format!(" {} {:.0}%", bar, pct)).into()
             } else {
-                Container::new(
-                    button(Text::new("Download").size(12))
-                        .on_press(Message::DownloadModel(i))
-                )
-                .padding(iced::Padding::new(0.0).left(8).right(8))
-                .into()
+                button(Text::new("Download").size(12))
+                    .on_press(Message::DownloadModel(i))
+                    .into()
             };
 
             let row: Element<'a, Message> = if downloaded {

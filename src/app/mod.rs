@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use iced::widget::{button, Column, Container, Row, Text};
@@ -50,6 +51,7 @@ pub enum Message {
     DownloadModel(usize),
     InitBackend,
     PollResults,
+    PollTrigger,
     RenameDocument(uuid::Uuid),
     RenameDocumentConfirm(String),
     AppendTranscript,
@@ -63,6 +65,7 @@ pub struct AppState {
     pub last_active_doc: Option<uuid::Uuid>,
     pub audio_capture: Option<AudioCapture>,
     pub backend: Option<WhisperBackend>,
+    pub worker_handle: Option<std::thread::JoinHandle<()>>,
     pub temp_content: String,
     pub is_recording: bool,
     pub is_paused: bool,
@@ -76,6 +79,9 @@ pub struct AppState {
     pub result_rx: Option<std::sync::mpsc::Receiver<TranscriptionResult>>,
     pub level_rx: Option<std::sync::mpsc::Receiver<f32>>,
     pub progress_rx: Option<std::sync::mpsc::Receiver<f32>>,
+    pub poll_tx: Option<std::sync::mpsc::Sender<()>>,
+    pub poll_rx: Option<std::sync::mpsc::Receiver<()>>,
+    pub download_done: std::sync::Arc<AtomicBool>,
     pub downloading_model: Option<usize>,
     pub error_message: Option<String>,
     pub rename_doc: Option<uuid::Uuid>,
@@ -94,6 +100,7 @@ impl Default for AppState {
             last_active_doc: None,
             audio_capture: None,
             backend: None,
+            worker_handle: None,
             temp_content: String::new(),
             is_recording: false,
             is_paused: false,
@@ -106,6 +113,9 @@ impl Default for AppState {
             result_rx: None,
             level_rx: None,
             progress_rx: None,
+           poll_tx: None,
+            poll_rx: None,
+            download_done: std::sync::Arc::new(AtomicBool::new(false)),
             downloading_model: None,
             error_message: None,
             rename_doc: None,
@@ -128,6 +138,7 @@ impl AppState {
     }
 
     pub fn init_backend(&mut self) -> Result<(), String> {
+        eprintln!("[APP] init_backend() START - selected_model_idx={}", self.selected_model_idx);
         let cache_dir = std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
             .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
@@ -141,6 +152,7 @@ impl AppState {
                 model.name
             ));
         }
+        eprintln!("[APP] init_backend() calling WhisperBackend::new()");
         let params = crate::inference::backend::BackendParams {
             language: Some(self.language.clone()),
             beam_size: 1,
@@ -148,6 +160,7 @@ impl AppState {
         };
         let backend = WhisperBackend::new(model.path.clone(), params)
             .map_err(|e| format!("Failed to load model: {}", e))?;
+        eprintln!("[APP] init_backend() WhisperBackend::new() returned, storing in self.backend");
         self.backend = Some(backend);
         Ok(())
     }
@@ -187,18 +200,32 @@ impl AppState {
              self.result_rx = Some(rx);
          }
          if let Some(rx) = self.level_rx.take() {
-             while let Ok(level) = rx.try_recv() {
-                 self.audio_level = level;
-             }
-             self.level_rx = Some(rx);
-         }
-         if let Some(rx) = self.progress_rx.take() {
-             while let Ok(pct) = rx.try_recv() {
-                 self.model_status = ModelStatus::Downloading(pct);
-             }
-             self.progress_rx = Some(rx);
-         }
-     }
+              while let Ok(level) = rx.try_recv() {
+                  self.audio_level = level;
+              }
+              self.level_rx = Some(rx);
+          }
+        if self.download_done.load(Ordering::Relaxed) {
+              return;
+          }
+          if let Some(rx) = self.progress_rx.take() {
+              while let Ok(pct) = rx.try_recv() {
+                  if pct >= 0.0 {
+                      // Don't overwrite error state
+                      if !matches!(self.model_status, ModelStatus::Error(_)) {
+                          self.model_status = ModelStatus::Downloading(pct);
+                      }
+                  }
+              }
+              self.progress_rx = Some(rx);
+          }
+          if let Some(rx) = self.poll_rx.take() {
+              while let Ok(()) = rx.try_recv() {
+                  // Just draining
+              }
+              self.poll_rx = Some(rx);
+          }
+      }
 
      /// Debounced auto-save: saves the active document only if more than
      /// SAVE_DEBOUNCE_SECONDS have passed since the last save. This prevents
@@ -218,7 +245,23 @@ impl AppState {
              }
              self.last_save_time = Some(now);
          }
-     }
+      }
+}
+
+  impl Drop for AppState {
+    fn drop(&mut self) {
+        eprintln!("[APP] AppState::drop() called!");
+        if let Some(ref mut audio) = self.audio_capture {
+            eprintln!("[APP] AppState::drop() stopping audio capture");
+            audio.stop();
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            eprintln!("[APP] AppState::drop() joining worker thread");
+            let _ = handle.join();
+            eprintln!("[APP] AppState::drop() worker thread joined");
+        }
+        eprintln!("[APP] AppState::drop() complete");
+    }
 }
 
 pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
@@ -264,48 +307,71 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StartRecord => {
+            eprintln!("[APP] StartRecord message received, is_recording={}", state.is_recording);
+            if state.is_recording {
+                eprintln!("[APP] StartRecord: already recording, returning");
+                return Task::none();
+            }
+            if state.downloading_model.is_some() {
+                state.error_message = Some("Cannot start recording while a model is downloading".to_string());
+                return Task::none();
+            }
+            eprintln!("[APP] StartRecord: backend_ready={}, audio_capture={}", state.is_backend_ready(), state.audio_capture.is_some());
             state.is_recording = true;
             state.is_paused = false;
             if !state.is_backend_ready() {
+                eprintln!("[APP] StartRecord: backend not ready, calling init_backend()");
                 if let Err(e) = state.init_backend() {
+                    eprintln!("[APP] StartRecord: init_backend() failed: {}", e);
                     state.error_message = Some(e);
                     state.is_recording = false;
                     return Task::none();
                 }
+                eprintln!("[APP] StartRecord: init_backend() succeeded");
             }
             if state.audio_capture.is_none() {
+                eprintln!("[APP] StartRecord: audio_capture is None, calling init_audio()");
                 if let Err(e) = state.init_audio() {
+                    eprintln!("[APP] StartRecord: init_audio() failed: {}", e);
                     state.error_message = Some(e);
                     state.is_recording = false;
                     return Task::none();
                 }
+                eprintln!("[APP] StartRecord: init_audio() succeeded");
             }
+            eprintln!("[APP] StartRecord: taking audio_capture and backend");
             let Some(mut audio) = state.audio_capture.take() else {
                 state.error_message = Some("Audio capture not initialized".to_string());
                 state.is_recording = false;
                 return Task::none();
             };
             let Some(backend) = state.backend.take() else {
+                eprintln!("[APP] StartRecord: backend was None, restoring audio");
                 state.audio_capture = Some(audio);
                 state.error_message = Some("Backend not initialized".to_string());
                 state.is_recording = false;
                 return Task::none();
             };
+            eprintln!("[APP] StartRecord: got backend and audio, starting audio stream");
 
             let (result_tx, result_rx) = std::sync::mpsc::channel();
+            eprintln!("[APP] StartRecord: created result channel");
             state.result_rx = Some(result_rx);
 
             match audio.start() {
                 Ok(()) => {
+                    eprintln!("[APP] StartRecord: audio started successfully");
                     let ring_buffer = audio.get_ring_buffer();
+                    let running = audio.get_running();
 
-                    std::thread::spawn(move || {
-                        worker::run_worker(ring_buffer, backend, result_tx);
-                    });
-
+                    let handle = worker::run_worker(ring_buffer, backend, result_tx, running);
+                    eprintln!("[APP] StartRecord: worker thread spawned, handle={:?}", std::ptr::addr_of!(handle).is_null());
+                    state.worker_handle = Some(handle);
                     state.audio_capture = Some(audio);
+                    eprintln!("[APP] StartRecord: all setup complete");
                 }
                 Err(e) => {
+                    eprintln!("[APP] StartRecord: audio.start() failed: {}", e);
                     state.audio_capture = Some(audio);
                     state.error_message = Some(format!("Failed to start recording: {}", e));
                     state.is_recording = false;
@@ -314,21 +380,31 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StopRecord => {
+            eprintln!("[APP] StopRecord: is_recording={}, backend={:?}, worker_handle={:?}",
+                state.is_recording,
+                state.backend.is_some(),
+                state.worker_handle.is_some()
+            );
             state.is_recording = false;
             state.is_paused = false;
-            // Ensure pending content is saved before stopping.
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
+            // Signal audio capture to stop (sets running = false)
             if let Some(mut audio) = state.audio_capture.take() {
+                eprintln!("[APP] StopRecord: stopping audio capture");
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
-            if state.backend.is_none() {
-                if let Some(backend) = std::mem::take(&mut state.backend) {
-                    state.backend = Some(backend);
-                }
+            // Join worker thread BEFORE dropping backend
+            if let Some(handle) = state.worker_handle.take() {
+                eprintln!("[APP] StopRecord: joining worker thread");
+                let _ = handle.join();
+                eprintln!("[APP] StopRecord: worker thread joined");
             }
+            // Now safe to drop backend
+            eprintln!("[APP] StopRecord: setting backend = None");
+            state.backend = None;
         }
 
         Message::ResumeRecord => {
@@ -353,45 +429,72 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::PollResults => {
             state.poll_results();
         }
+        Message::PollTrigger => {
+            state.poll_results();
+        }
 
         Message::ShowSettings => {
             state.show_settings = true;
         }
-        Message::HideSettings => {
+       Message::HideSettings => {
+            state.downloading_model = None;
+            state.progress_rx = None;
+            state.poll_tx = None;
+            state.poll_rx = None;
+            state.download_done.store(false, Ordering::Relaxed);
             state.show_settings = false;
         }
-        Message::SaveSettings => {
-            if let Err(e) = state.init_backend() {
-                state.model_status = ModelStatus::Error(e);
+       Message::SaveSettings => {
+            eprintln!("[APP] SaveSettings: backend.is_none()={}, is_recording={}", state.backend.is_none(), state.is_recording);
+            state.downloading_model = None;
+            state.progress_rx = None;
+            state.poll_tx = None;
+            state.poll_rx = None;
+            state.download_done.store(false, Ordering::Relaxed);
+            // Only reinitialize the backend if it hasn't been loaded yet.
+            // If recording is active, the backend is already running in the worker thread
+            // and re-initializing would cause double model load → memory corruption crash.
+            if state.backend.is_none() {
+                eprintln!("[APP] SaveSettings: backend is None, calling init_backend()");
+                if let Err(e) = state.init_backend() {
+                    eprintln!("[APP] SaveSettings: init_backend() failed: {}", e);
+                    state.model_status = ModelStatus::Error(e);
+                } else {
+                    eprintln!("[APP] SaveSettings: init_backend() succeeded");
+                    state.model_status = ModelStatus::Ready;
+                }
             } else {
-                state.model_status = ModelStatus::Ready;
-                state.show_settings = false;
-                let _ = save_app_state(state);
+                eprintln!("[APP] SaveSettings: backend already exists, skipping init");
             }
+            state.show_settings = false;
+            let _ = save_app_state(state);
         }
 
         Message::ModelDownloadProgress(pct) => {
             state.model_status = ModelStatus::Downloading(pct);
         }
-        Message::ModelDownloadComplete => {
+       Message::ModelDownloadComplete => {
             state.model_status = ModelStatus::Ready;
             state.downloading_model = None;
+            state.progress_rx = None;
+            state.poll_tx = None;
+            state.poll_rx = None;
+            state.download_done.store(true, Ordering::Relaxed);
             state.load_models();
         }
-        Message::ModelDownloadError(err) => {
-            state.model_status = ModelStatus::Error(err);
+      Message::ModelDownloadError(err) => {
             state.downloading_model = None;
+            state.progress_rx = None;
+            state.poll_tx = None;
+            state.poll_rx = None;
+            state.download_done.store(true, Ordering::Relaxed);
+            state.model_status = ModelStatus::Error(err);
         }
-        Message::ModelSelected(idx) => {
+       Message::ModelSelected(idx) => {
             state.selected_model_idx = idx;
-            if let Some(model) = crate::inference::backend::model_manager::ModelManager::new(
-                std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models")),
-            )
-            .get_model_by_index(idx)
-            {
-                if model.downloaded {
+            if idx < state.models.len() {
+                let downloaded = state.models[idx].downloaded;
+                if downloaded {
                     state.model_status = ModelStatus::Ready;
                 } else {
                     state.model_status = ModelStatus::NotDownloaded;
@@ -403,23 +506,52 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.language = lang;
             let _ = save_app_state(state);
         }
-        Message::DownloadModel(idx) => {
+    Message::DownloadModel(idx) => {
+            if state.downloading_model.is_some() {
+                return Task::none();
+            }
             state.model_status = ModelStatus::Downloading(0.0);
             let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+            let (poll_tx, poll_rx) = std::sync::mpsc::channel();
+            let ticker_poll_tx = poll_tx.clone();
+            let download_done = std::sync::Arc::new(AtomicBool::new(false));
             state.downloading_model = Some(idx);
             state.progress_rx = Some(progress_rx);
+            state.poll_tx = Some(poll_tx.clone());
+            state.poll_rx = Some(poll_rx);
+            state.download_done = download_done.clone();
             let progress = crate::inference::backend::model_manager::ProgressSender::new(progress_tx);
             let cache_dir = std::env::var("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
                 .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
             let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
-            let rt = get_tokio_runtime();
-            return Task::perform(async move {
-                match rt.block_on(async { manager.download(idx, progress).await }) {
-                    Ok(_) => Message::ModelDownloadComplete,
-                    Err(e) => Message::ModelDownloadError(e),
+            let done_clone = download_done.clone();
+            // Background download thread
+            std::thread::spawn(move || {
+                let rt = get_tokio_runtime();
+                let result = rt.block_on(manager.download(idx, &progress));
+                if result.is_err() {
+                    let _ = progress.send(0.0);
+                    let _ = poll_tx.send(());
+                    let _ = poll_tx.send(());
                 }
-            }, |msg| msg);
+                done_clone.store(true, Ordering::Relaxed);
+                drop(progress);
+            });
+            // Ticker thread that periodically triggers poll_results
+            std::thread::spawn(move || {
+                use std::time::Duration;
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if download_done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if ticker_poll_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            return Task::none();
         }
         Message::InitBackend => {
             if let Err(e) = state.init_backend() {
