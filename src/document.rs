@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+fn default_instant() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptLine {
     pub timestamp: String,
@@ -34,6 +38,8 @@ impl TranscriptLine {
     }
 }
 
+const MAX_TRANSCRIPT_LINES: usize = 2000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: Uuid,
@@ -42,6 +48,8 @@ pub struct Document {
     pub transcript_lines: Vec<TranscriptLine>,
     pub created_at: i64,
     pub modified_at: i64,
+    #[serde(skip, default = "default_instant")]
+    pub last_save_at: std::time::Instant,
 }
 
 impl Document {
@@ -54,6 +62,7 @@ impl Document {
             transcript_lines: Vec::new(),
             created_at: now,
             modified_at: now,
+            last_save_at: std::time::Instant::now(),
         }
     }
 
@@ -68,8 +77,15 @@ impl Document {
             .replace("--", "-")
     }
 
+    pub fn trim_transcript_lines(&mut self) {
+        if self.transcript_lines.len() > MAX_TRANSCRIPT_LINES {
+            self.transcript_lines.drain(..self.transcript_lines.len() - MAX_TRANSCRIPT_LINES);
+        }
+    }
+
     pub fn parse_lines_from_content(&mut self) {
         self.transcript_lines = TranscriptLine::parse_content(&self.content);
+        self.trim_transcript_lines();
     }
 
     pub fn to_filename(&self) -> String {

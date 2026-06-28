@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::document::{Document, TranscriptLine};
 
 const DOCUMENTS_DIR: &str = "documents";
+const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct Workspace {
     pub documents: BTreeMap<Uuid, Document>,
@@ -48,6 +49,7 @@ impl Workspace {
                                     transcript_lines,
                                     created_at: chrono::Utc::now().timestamp(),
                                     modified_at: chrono::Utc::now().timestamp(),
+                                    last_save_at: std::time::Instant::now(),
                                 });
                             }
                         }
@@ -108,6 +110,23 @@ impl Workspace {
             fs::write(path, &doc.content)?;
         }
         Ok(())
+    }
+
+    pub fn save_if_needed(&mut self, id: Uuid) -> Result<(), std::io::Error> {
+        let needs_save = self.documents.get(&id)
+            .map(|doc| doc.last_save_at.elapsed() >= SAVE_INTERVAL)
+            .unwrap_or(false);
+        if needs_save {
+            self.save(id)?;
+            if let Some(doc) = self.documents.get_mut(&id) {
+                doc.last_save_at = std::time::Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_all_forced(&self) -> Result<(), std::io::Error> {
+        self.save_all()
     }
 
     pub fn save_all(&self) -> Result<(), std::io::Error> {

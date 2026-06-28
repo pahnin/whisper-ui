@@ -15,8 +15,10 @@ pub struct WhisperBackend {
     state: WhisperState,
     language: Option<String>,
     pub accelerator: String,
+    pub fallback_to_cpu: bool,
     /// Text accumulated across chunk boundaries for context preservation.
     accumulated_text: String,
+    chunks_processed: usize,
 }
 
 impl WhisperBackend {
@@ -88,7 +90,9 @@ impl WhisperBackend {
             state,
             language: params.language,
             accelerator,
+            fallback_to_cpu: false,
             accumulated_text: String::new(),
+            chunks_processed: 0,
         })
     }
 
@@ -130,7 +134,9 @@ impl WhisperBackend {
             state,
             language: params.language,
             accelerator: "CPU".to_string(),
+            fallback_to_cpu: true,
             accumulated_text: String::new(),
+            chunks_processed: 0,
         })
     }
 
@@ -138,6 +144,12 @@ impl WhisperBackend {
     /// `set_no_context(false)` retains the decoder's KV-cache across calls,
     /// allowing the model to carry forward attention state from previous
     /// chunks. A short prompt (last 150 chars) provides linguistic context.
+    pub fn reset_state(&mut self) -> Result<(), BackendError> {
+        self.state = self.ctx.create_state()
+            .map_err(|e| BackendError::Internal(format!("Failed to reset state: {}", e)))?;
+        Ok(())
+    }
+
     pub fn transcribe_segment_sync(
         &mut self,
         audio_data: &[f32],
@@ -157,12 +169,15 @@ impl WhisperBackend {
         let strategy = SamplingStrategy::Greedy { best_of: 1 };
         let mut params = FullParams::new(strategy);
         params.set_language(self.language.as_deref());
-        params.set_n_threads(4);
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8).max(2))
+            .unwrap_or(4) as i32;
+        params.set_n_threads(n_threads);
         params.set_no_context(false);
 
         if !self.accumulated_text.is_empty() {
-            let prompt = if self.accumulated_text.len() > 150 {
-                &self.accumulated_text[self.accumulated_text.len() - 150..]
+            let prompt = if self.accumulated_text.len() > 300 {
+                &self.accumulated_text[self.accumulated_text.len() - 300..]
             } else {
                 &self.accumulated_text
             };
@@ -172,9 +187,15 @@ impl WhisperBackend {
             params.set_initial_prompt(prompt);
         }
 
-        self.state
-            .full(params, audio_data)
-            .map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
+        let mut full_result = self.state.full(params.clone(), audio_data);
+        if full_result.is_err() && !self.fallback_to_cpu {
+            eprintln!("[WHISPER] GPU transcription failed, falling back to CPU");
+            self.fallback_to_cpu = true;
+            self.state = self.ctx.create_state()
+                .map_err(|e| BackendError::Internal(format!("Failed to create CPU state: {}", e)))?;
+            full_result = self.state.full(params, audio_data);
+        }
+        full_result.map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
 
         let mut all_text = String::new();
         for segment in self.state.as_iter() {
@@ -191,22 +212,37 @@ impl WhisperBackend {
             }
         }
 
-        // Update accumulated text — only append if this is new text
         if !all_text.is_empty() {
             let trimmed_new = all_text.trim();
-            if self.accumulated_text.is_empty()
-                || !self.accumulated_text.trim().ends_with(trimmed_new)
-            {
-                if !self.accumulated_text.is_empty() && !self.accumulated_text.trim().is_empty() {
-                    self.accumulated_text.push(' ');
+            let acc_trimmed = self.accumulated_text.trim();
+            
+            if acc_trimmed.is_empty() {
+                self.accumulated_text = trimmed_new.to_string();
+            } else if trimmed_new.starts_with(acc_trimmed) {
+                let rest = trimmed_new[acc_trimmed.len()..].trim();
+                if !rest.is_empty() {
+                    self.accumulated_text.push_str(rest);
                 }
+            } else if acc_trimmed.starts_with(trimmed_new) {
+            } else {
+                self.accumulated_text.push(' ');
                 self.accumulated_text.push_str(trimmed_new);
-                if std::env::var("WHISPER_DEBUG").is_ok() {
-                    eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
-                }
-            } else if std::env::var("WHISPER_DEBUG").is_ok() {
-                eprintln!("[WHISPER DUPLICATE] Skipped (already in accumulated)");
             }
+            
+           if std::env::var("WHISPER_DEBUG").is_ok() {
+                eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
+            }
+        }
+
+        if self.accumulated_text.len() > 2048 {
+            self.accumulated_text = self.accumulated_text[self.accumulated_text.len() - 2048..].to_string();
+        }
+
+        self.chunks_processed += 1;
+        if self.chunks_processed % 180 == 0 {
+            self.state = self.ctx.create_state()
+                .map_err(|e| BackendError::Internal(format!("Failed to reset state: {}", e)))?;
+            self.chunks_processed = 0;
         }
 
         if !all_text.is_empty() {

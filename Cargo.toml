@@ -16,8 +16,9 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 thiserror = "2"
-ringbuffer = "0.15"
+crossbeam-queue = "0.3"
 futures-lite = "2"
+crossbeam-channel = "0.3"
 
 [dev-dependencies]
 hound = "3.5"

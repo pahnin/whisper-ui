@@ -1,11 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, StreamConfig};
-use ringbuffer::{AllocRingBuffer, RingBuffer};
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const TARGET_CHANNELS: u16 = 1;
@@ -110,8 +109,9 @@ fn build_ring_buffer_capacity(sample_rate: u32, _channels: u16, seconds: usize) 
 }
 
 pub struct AudioCapture {
+    pub sample_rate: u32,
     device_config: DeviceConfig,
-    ring_buffer: Arc<Mutex<AllocRingBuffer<f32>>>,
+    ring_buffer: Arc<crossbeam_queue::ArrayQueue<f32>>,
     running: Arc<AtomicBool>,
     level_tx: Sender<f32>,
     stream_handle: Option<cpal::Stream>,
@@ -133,10 +133,11 @@ impl AudioCapture {
                 device_config.stream_config.channels,
                 RING_BUFFER_SECONDS,
             );
-        let ring_buffer: Arc<Mutex<AllocRingBuffer<f32>>> =
-            Arc::new(Mutex::new(AllocRingBuffer::new(capacity)));
+        let ring_buffer: Arc<crossbeam_queue::ArrayQueue<f32>> =
+            Arc::new(crossbeam_queue::ArrayQueue::new(capacity));
 
         Ok(Self {
+            sample_rate: device_config.stream_config.sample_rate.0,
             device_config,
             ring_buffer,
             running: Arc::new(AtomicBool::new(false)),
@@ -169,14 +170,8 @@ impl AudioCapture {
                     &config,
                     move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                         if !data.is_empty() {
-                            if let Ok(mut rb) = ring_buffer.lock() {
-                                let available = rb.capacity() - rb.len();
-                                if available > 0 {
-                                    let to_push = data.len().min(available);
-                                    for &value in &data[..to_push] {
-                                        let _ = rb.push(value);
-                                    }
-                                }
+                            for &value in data {
+                                let _ = ring_buffer.push(value);
                             }
                             let rms = (data.iter().map(|x| x * x).sum::<f32>()
                                 / data.len() as f32)
@@ -197,14 +192,8 @@ impl AudioCapture {
                     &config,
                     move |data: &[i16], _info: &cpal::InputCallbackInfo| {
                         if !data.is_empty() {
-                            if let Ok(mut rb) = ring_buffer.lock() {
-                                let available = rb.capacity() - rb.len();
-                                if available > 0 {
-                                    let to_push = data.len().min(available);
-                                    for &value in &data[..to_push] {
-                                        let _ = rb.push(value as f32 / 32768.0);
-                                    }
-                                }
+                            for &value in data {
+                                let _ = ring_buffer.push(value as f32 / 32768.0);
                             }
                             let rms = data
                                 .iter()
@@ -241,7 +230,7 @@ impl AudioCapture {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn get_ring_buffer(&self) -> Arc<Mutex<AllocRingBuffer<f32>>> {
+    pub fn get_ring_buffer(&self) -> Arc<crossbeam_queue::ArrayQueue<f32>> {
         self.ring_buffer.clone()
     }
 

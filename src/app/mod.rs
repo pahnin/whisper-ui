@@ -67,8 +67,8 @@ pub struct AppState {
     pub model_loaded: bool,
     pub language: String,
     pub language_options: Vec<(String, String)>,
-    pub result_rx: Option<std::sync::mpsc::Receiver<TranscriptionResult>>,
-    pub result_tx: Option<std::sync::mpsc::Sender<TranscriptionResult>>,
+    pub result_rx: Option<crossbeam_channel::Receiver<TranscriptionResult>>,
+    pub result_tx: Option<crossbeam_channel::Sender<TranscriptionResult>>,
     pub level_rx: Option<std::sync::mpsc::Receiver<f32>>,
     pub progress_rx: Option<std::sync::mpsc::Receiver<f32>>,
     pub download_done: std::sync::Arc<AtomicBool>,
@@ -184,15 +184,21 @@ impl AppState {
             let now = chrono::Local::now().format("%H:%M:%S");
             let timestamp = format!("[{}] ", now);
             let formatted = format!("{}{}\n", timestamp, text.trim());
-            if let Some(doc) = self.workspace.active_mut() {
+            let id = if let Some(doc) = self.workspace.active_mut() {
                 doc.content.push_str(&formatted);
                 doc.transcript_lines.push(TranscriptLine {
                     timestamp,
                     text: text.trim().to_string(),
                 });
                 doc.modified_at = chrono::Utc::now().timestamp();
-                let id = doc.id;
-                let _ = self.workspace.save(id);
+                let doc_id = doc.id;
+                doc.trim_transcript_lines();
+                Some(doc_id)
+            } else {
+                None
+            };
+            if let Some(doc_id) = id {
+                let _ = self.workspace.save_if_needed(doc_id);
             }
         }
     }
@@ -328,7 +334,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 return Task::none();
             };
 
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = crossbeam_channel::bounded(10);
             state.result_tx = Some(result_tx.clone());
             state.result_rx = Some(result_rx);
 
@@ -336,7 +342,8 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 Ok(()) => {
                     let ring_buffer = audio.get_ring_buffer();
                     let running = audio.get_running();
-                    let handle = worker::run_worker(ring_buffer, backend, result_tx, running);
+                    let sample_rate = audio.sample_rate;
+                    let handle = worker::run_worker(ring_buffer, backend, result_tx, running, sample_rate);
                     state.worker_handle = Some(handle);
                     state.audio_capture = Some(audio);
                 }
@@ -354,6 +361,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
+            let _ = state.workspace.save_all_forced();
             state.result_tx.take();
             if let Some(mut audio) = state.audio_capture.take() {
                 audio.stop();
