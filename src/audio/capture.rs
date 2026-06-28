@@ -75,9 +75,8 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        if let Some(&value) = data.first() {
-                            let _ = level_tx.send((value.abs() * 100.0) as f32);
-                        }
+                        let rms = (data.iter().map(|x| x * x).sum::<f32>() / data.len() as f32).sqrt() * 100.0;
+                        let _ = level_tx.send(rms);
                     }
                 },
                 err_fn,
@@ -97,19 +96,6 @@ impl AudioCapture {
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
-    }
-
-    pub fn get_audio_chunk(&self) -> Vec<f32> {
-        let mut chunk = Vec::new();
-        let samples = (SAMPLE_RATE as usize) * BUFFER_DURATION_SECS as usize;
-        if let Ok(mut rb) = self.ring_buffer.lock() {
-            for _ in 0..samples {
-                if let Some(value) = rb.dequeue() {
-                    chunk.push(value);
-                }
-            }
-        }
-        chunk
     }
 
     pub fn get_ring_buffer(&self) -> Arc<Mutex<AllocRingBuffer<f32>>> {

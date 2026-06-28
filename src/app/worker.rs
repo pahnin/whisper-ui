@@ -47,7 +47,13 @@ pub fn run_worker(
             // Drain available samples from ring buffer
             let mut drained: Vec<f32> = Vec::new();
             {
-                let mut rb = ring_buffer.lock().unwrap();
+                let mut rb = match ring_buffer.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        eprintln!("[WORKER] Ring buffer lock poisoned, exiting worker: {}", e);
+                        break;
+                    }
+                };
                 while let Some(value) = rb.dequeue() {
                     drained.push(value);
                 }
@@ -61,7 +67,7 @@ pub fn run_worker(
             if recent_audio.len() >= next_flush_at {
                 // Build chunk with overlap
                 let start_idx = if flush_offset + overlap_samples < recent_audio.len() {
-                    recent_audio.len() - (next_flush_at - flush_offset) - overlap_samples
+                    recent_audio.len().saturating_sub(next_flush_at.saturating_sub(flush_offset)).saturating_sub(overlap_samples)
                 } else {
                     0
                 };

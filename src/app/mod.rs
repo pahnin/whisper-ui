@@ -348,9 +348,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
-            if let Some(handle) = state.worker_handle.take() {
-                let _ = handle.join();
-            }
+            state.worker_handle = None;
             state.poll_results();
             if state.selected_model_idx < state.models.len()
                 && state.models[state.selected_model_idx].downloaded {

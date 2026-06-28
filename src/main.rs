@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 pub mod app;
 pub mod document;
 pub mod workspace;
@@ -16,9 +14,23 @@ fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::
 }
 
 fn tick_stream() -> impl futures_lite::stream::Stream<Item = crate::app::Message> {
-    futures_lite::stream::unfold((), |()| async {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        Some((crate::app::Message::PollTrigger, ()))
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let _ = tx.send(crate::app::Message::PollTrigger);
+        }
+    });
+    futures_lite::stream::unfold(rx, |rx| async move {
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => return Some((msg, rx)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    futures_lite::future::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            }
+        }
     })
 }
 
