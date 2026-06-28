@@ -40,7 +40,9 @@ pub fn run_worker(
         let mut next_flush_at: usize = min_samples;
 
         loop {
-            if !running.load(Ordering::SeqCst) {
+            let running = running.load(Ordering::SeqCst);
+            eprintln!("[WORKER] Loop iteration, running={}", running);
+            if !running {
                 break;
             }
 
@@ -60,6 +62,7 @@ pub fn run_worker(
             }
 
             if !drained.is_empty() {
+                eprintln!("[WORKER] Drained {} samples from ring buffer (total: {})", drained.len(), recent_audio.len() + drained.len());
                 recent_audio.extend(drained);
             }
 
@@ -78,6 +81,7 @@ pub fn run_worker(
                 match backend.transcribe_segment_sync(&chunk) {
                     Ok(segment) => {
                         if !segment.text.is_empty() {
+                            eprintln!("[WORKER] Sending result: '{}'", segment.text);
                             if let Err(e) = result_tx.send(TranscriptionResult::Segment(segment.text)) {
                                 eprintln!("[WORKER] Failed to send transcription result: {}", e);
                                 break;

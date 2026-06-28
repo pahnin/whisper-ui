@@ -6,21 +6,23 @@ pub mod audio;
 pub mod ui;
 
 fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::Message> {
-    if state.is_recording {
+    let poll_recording = if state.is_recording {
         iced::time::every(std::time::Duration::from_millis(1000))
             .map(|_| crate::app::Message::PollTrigger)
     } else {
         iced::Subscription::none()
-    }
+    };
+    let poll_download = if state.downloading_model.is_some() {
+        iced::time::every(std::time::Duration::from_millis(1000))
+            .map(|_| crate::app::Message::DownloadPoll)
+    } else {
+        iced::Subscription::none()
+    };
+    iced::Subscription::batch([poll_recording, poll_download])
 }
 
 fn main() {
-    let language_options = {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            crate::inference::backend::model_manager::ModelManager::language_options()
-        })
-    };
+    let language_options = crate::inference::backend::model_manager::ModelManager::language_options();
 
     let boot = move || {
         let base_dir = std::env::var("HOME")

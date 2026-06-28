@@ -74,10 +74,10 @@ impl WhisperBackend {
         })
     }
 
-    /// Synchronous transcription with context preservation.
-    /// Uses single-segment mode and text context from previous calls to maintain
-    /// coherence across chunk boundaries. The accumulated_text field carries
-    /// previously transcribed text as a decoder prompt.
+    /// Synchronous transcription with Whisper's native context passing.
+    /// `set_no_context(false)` retains the decoder's KV-cache across calls,
+    /// allowing the model to carry forward attention state from previous
+    /// chunks. A short prompt (last 150 chars) provides linguistic context.
     pub fn transcribe_segment_sync(
         &mut self,
         audio_data: &[f32],
@@ -90,23 +90,24 @@ impl WhisperBackend {
             });
         }
 
+        eprintln!("[WHISPER CHUNK] {} samples ({:.2}s)", audio_data.len(), audio_data.len() as f64 / 16000.0);
+
         let strategy = SamplingStrategy::Greedy { best_of: 1 };
         let mut params = FullParams::new(strategy);
         params.set_language(self.language.as_deref());
         params.set_n_threads(4);
-        // Single segment mode prevents Whisper from splitting one chunk into
-        // multiple fragments, which causes text duplication across calls.
-        params.set_single_segment(true);
-        // Preserve text context: feed previous transcription as decoder prompt
-        // so the model knows what has already been said.
+        // Enable Whisper's native context retention — carries forward the
+        // decoder's KV-cache so each chunk benefits from previous decoding state.
         params.set_no_context(false);
-        // Set initial prompt from accumulated text (truncated to reasonable length).
+
+        // Use last 150 chars as initial prompt for linguistic context.
         if !self.accumulated_text.is_empty() {
-            let prompt = if self.accumulated_text.len() > 200 {
-                &self.accumulated_text[self.accumulated_text.len() - 200..]
+            let prompt = if self.accumulated_text.len() > 150 {
+                &self.accumulated_text[self.accumulated_text.len() - 150..]
             } else {
                 &self.accumulated_text
             };
+            eprintln!("[WHISPER PROMPT] '{}'", prompt);
             params.set_initial_prompt(prompt);
         }
 
@@ -114,14 +115,12 @@ impl WhisperBackend {
             .full(params, audio_data)
             .map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
 
-        // Collect segments — with single-segment mode there should be at most one
         let mut all_text = String::new();
-        let mut segments_found: Vec<String> = Vec::new();
         for segment in self.state.as_iter() {
             let text = segment.to_str_lossy().unwrap_or_default();
+            eprintln!("[WHISPER RAW] '{}'", text.trim());
             if !text.is_empty() {
                 let trimmed = text.trim().to_string();
-                segments_found.push(trimmed.clone());
                 if !all_text.is_empty() {
                     all_text.push(' ');
                 }
@@ -129,28 +128,25 @@ impl WhisperBackend {
             }
         }
 
-        // Update accumulated text with newly transcribed content
+        // Update accumulated text — only append if this is new text
         if !all_text.is_empty() {
-            if !self.accumulated_text.is_empty() && !all_text.is_empty() {
-                // Avoid duplicating text: check if the new text starts with the end of accumulated
-                let last_chars = if self.accumulated_text.len() > 30 {
-                    &self.accumulated_text[self.accumulated_text.len() - 30..]
-                } else {
-                    &self.accumulated_text
-                };
-                if !all_text.starts_with(last_chars) {
+            let trimmed_new = all_text.trim();
+            if self.accumulated_text.is_empty()
+                || !self.accumulated_text.trim().ends_with(trimmed_new)
+            {
+                if !self.accumulated_text.is_empty() && !self.accumulated_text.trim().is_empty() {
                     self.accumulated_text.push(' ');
-                    self.accumulated_text.push_str(&all_text);
                 }
-            } else if !self.accumulated_text.is_empty() {
-                self.accumulated_text.push(' ');
-                self.accumulated_text.push_str(&all_text);
+                self.accumulated_text.push_str(trimmed_new);
+                eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
             } else {
-                self.accumulated_text = all_text.clone();
+                eprintln!("[WHISPER DUPLICATE] Skipped (already in accumulated)");
             }
         }
 
-        eprintln!("[WHISPER] {}", all_text);
+        if !all_text.is_empty() {
+            eprintln!("[WHISPER] {}", all_text);
+        }
 
         let segment = TranscriptSegment {
             text: all_text,

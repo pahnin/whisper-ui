@@ -1,22 +1,9 @@
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-
 use iced::widget::{button, Column, Container, Row, Text};
 use iced::{Element, Length, Task};
 
 use crate::audio::capture::AudioCapture;
-
-static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-
-fn get_tokio_runtime() -> &'static tokio::runtime::Runtime {
-    TOKIO_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-    })
-}
 use crate::inference::backend::whisper_backend::WhisperBackend;
 use crate::inference::backend::model_manager::ModelInfo;
 use crate::workspace::Workspace;
@@ -50,8 +37,8 @@ pub enum Message {
     LoadModel(usize),
     InitBackend,
     BackendInitError(String),
-    PollResults,
     PollTrigger,
+    DownloadPoll,
     RenameDocument(uuid::Uuid),
     RenameDocumentConfirm(String),
     ClearError,
@@ -66,7 +53,6 @@ pub struct AppState {
     pub backend: Option<WhisperBackend>,
     pub worker_handle: Option<std::thread::JoinHandle<()>>,
     pub download_thread_handle: Option<std::thread::JoinHandle<()>>,
-    pub ticker_thread_handle: Option<std::thread::JoinHandle<()>>,
     pub is_recording: bool,
     pub is_paused: bool,
     pub audio_level: f32,
@@ -78,10 +64,9 @@ pub struct AppState {
     pub language: String,
     pub language_options: Vec<(String, String)>,
     pub result_rx: Option<std::sync::mpsc::Receiver<TranscriptionResult>>,
+    pub result_tx: Option<std::sync::mpsc::Sender<TranscriptionResult>>,
     pub level_rx: Option<std::sync::mpsc::Receiver<f32>>,
     pub progress_rx: Option<std::sync::mpsc::Receiver<f32>>,
-    pub poll_tx: Option<std::sync::mpsc::Sender<()>>,
-    pub poll_rx: Option<std::sync::mpsc::Receiver<()>>,
     pub download_done: std::sync::Arc<AtomicBool>,
     pub downloading_model: Option<usize>,
     pub error_message: Option<String>,
@@ -101,7 +86,6 @@ impl Default for AppState {
             backend: None,
             worker_handle: None,
             download_thread_handle: None,
-            ticker_thread_handle: None,
             is_recording: false,
             is_paused: false,
             audio_level: 0.0,
@@ -112,10 +96,10 @@ impl Default for AppState {
             model_loaded: false,
             language: "en".to_string(),
             result_rx: None,
+            result_tx: None,
             level_rx: None,
             progress_rx: None,
-           poll_tx: None,
-            poll_rx: None,
+           
             download_done: std::sync::Arc::new(AtomicBool::new(false)),
             downloading_model: None,
             error_message: None,
@@ -211,6 +195,7 @@ impl AppState {
             while let Ok(result) = rx.try_recv() {
                 match result {
                     TranscriptionResult::Segment(text) => {
+                        eprintln!("[APP] Received transcription result: '{}'", text);
                         self.handle_transcription_result(text);
                     }
                     TranscriptionResult::Error(err) => {
@@ -240,35 +225,20 @@ impl AppState {
             }
             self.progress_rx = Some(rx);
         }
-        if let Some(rx) = self.poll_rx.take() {
-            while let Ok(()) = rx.try_recv() {
-                // Just draining
-            }
-            self.poll_rx = Some(rx);
-        }
     }
 }
 
-impl Drop for AppState {
+  impl Drop for AppState {
     fn drop(&mut self) {
         if let Some(ref mut audio) = self.audio_capture {
             audio.stop();
         }
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.download_thread_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.ticker_thread_handle.take() {
-            let _ = handle.join();
-        }
+        self.worker_handle.take();
+        self.download_thread_handle.take();
     }
 }
 
 pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
-    state.poll_results();
-
     match message {
         Message::NewDocument => {
             let id = state.workspace.new_document();
@@ -330,6 +300,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             };
 
             let (result_tx, result_rx) = std::sync::mpsc::channel();
+            state.result_tx = Some(result_tx.clone());
             state.result_rx = Some(result_rx);
 
             match audio.start() {
@@ -354,11 +325,12 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
+            state.result_tx.take();
             if let Some(mut audio) = state.audio_capture.take() {
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
-            state.worker_handle = None;
+            state.worker_handle.take();
             state.poll_results();
             if state.selected_model_idx < state.models.len()
                 && state.models[state.selected_model_idx].downloaded {
@@ -382,10 +354,10 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.audio_level = level;
         }
 
-        Message::PollResults => {
+         Message::PollTrigger => {
             state.poll_results();
         }
-        Message::PollTrigger => {
+        Message::DownloadPoll => {
             state.poll_results();
         }
 
@@ -395,16 +367,12 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
        Message::HideSettings => {
             state.downloading_model = None;
             state.progress_rx = None;
-            state.poll_tx = None;
-            state.poll_rx = None;
             state.download_done.store(false, Ordering::Relaxed);
             state.show_settings = false;
         }
        Message::SaveSettings => {
             state.downloading_model = None;
             state.progress_rx = None;
-            state.poll_tx = None;
-            state.poll_rx = None;
             state.download_done.store(false, Ordering::Relaxed);
             if state.backend.is_none() {
                 if let Err(e) = state.init_backend() {
@@ -424,17 +392,13 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.model_status = ModelStatus::Ready;
             state.downloading_model = None;
             state.progress_rx = None;
-            state.poll_tx = None;
-            state.poll_rx = None;
             state.download_done.store(true, Ordering::Relaxed);
             state.load_models();
         }
-     Message::ModelDownloadError(err) => {
-             state.downloading_model = None;
-             state.progress_rx = None;
-             state.poll_tx = None;
-             state.poll_rx = None;
-             state.download_done.store(true, Ordering::Relaxed);
+ Message::ModelDownloadError(err) => {
+              state.downloading_model = None;
+              state.progress_rx = None;
+              state.download_done.store(true, Ordering::Relaxed);
              state.model_status = ModelStatus::Error(err);
          }
         Message::BackendInitError(err) => {
@@ -458,19 +422,15 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.language = lang;
             let _ = save_app_state(state);
         }
-    Message::DownloadModel(idx) => {
+     Message::DownloadModel(idx) => {
             if state.downloading_model.is_some() {
                 return Task::none();
             }
             state.model_status = ModelStatus::Downloading(0.0);
             let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-            let (poll_tx, poll_rx) = std::sync::mpsc::channel();
-            let ticker_poll_tx = poll_tx.clone();
             let download_done = std::sync::Arc::new(AtomicBool::new(false));
             state.downloading_model = Some(idx);
             state.progress_rx = Some(progress_rx);
-            state.poll_tx = Some(poll_tx.clone());
-            state.poll_rx = Some(poll_rx);
             state.download_done = download_done.clone();
             let progress = crate::inference::backend::model_manager::ProgressSender::new(progress_tx);
             let cache_dir = std::env::var("HOME")
@@ -480,31 +440,15 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             let done_clone = download_done.clone();
             // Background download thread
             let download_handle = std::thread::spawn(move || {
-                let rt = get_tokio_runtime();
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create download runtime");
                 let result = rt.block_on(manager.download(idx, &progress));
                 if result.is_err() {
                     let _ = progress.send(0.0);
-                    let _ = poll_tx.send(());
-                    let _ = poll_tx.send(());
                 }
                 done_clone.store(true, Ordering::Relaxed);
                 drop(progress);
             });
             state.download_thread_handle = Some(download_handle);
-            // Ticker thread that periodically triggers poll_results
-            let ticker_handle = std::thread::spawn(move || {
-                use std::time::Duration;
-                loop {
-                    std::thread::sleep(Duration::from_millis(100));
-                    if download_done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if ticker_poll_tx.send(()).is_err() {
-                        break;
-                    }
-                }
-            });
-            state.ticker_thread_handle = Some(ticker_handle);
             return Task::none();
         }
         Message::LoadModel(idx) => {
