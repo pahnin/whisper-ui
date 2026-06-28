@@ -7,31 +7,11 @@ pub mod ui;
 
 fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::Message> {
     if state.is_recording {
-        iced::Subscription::run(tick_stream)
+        iced::time::every(std::time::Duration::from_millis(1000))
+            .map(|_| crate::app::Message::PollTrigger)
     } else {
         iced::Subscription::none()
     }
-}
-
-fn tick_stream() -> impl futures_lite::stream::Stream<Item = crate::app::Message> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-            let _ = tx.send(crate::app::Message::PollTrigger);
-        }
-    });
-    futures_lite::stream::unfold(rx, |rx| async move {
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => return Some((msg, rx)),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    futures_lite::future::yield_now().await;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
-            }
-        }
-    })
 }
 
 fn main() {

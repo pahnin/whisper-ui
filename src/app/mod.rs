@@ -65,6 +65,8 @@ pub struct AppState {
     pub audio_capture: Option<AudioCapture>,
     pub backend: Option<WhisperBackend>,
     pub worker_handle: Option<std::thread::JoinHandle<()>>,
+    pub download_thread_handle: Option<std::thread::JoinHandle<()>>,
+    pub ticker_thread_handle: Option<std::thread::JoinHandle<()>>,
     pub is_recording: bool,
     pub is_paused: bool,
     pub audio_level: f32,
@@ -98,6 +100,8 @@ impl Default for AppState {
             audio_capture: None,
             backend: None,
             worker_handle: None,
+            download_thread_handle: None,
+            ticker_thread_handle: None,
             is_recording: false,
             is_paused: false,
             audio_level: 0.0,
@@ -251,6 +255,12 @@ impl Drop for AppState {
             audio.stop();
         }
         if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.download_thread_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.ticker_thread_handle.take() {
             let _ = handle.join();
         }
     }
@@ -469,7 +479,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
             let done_clone = download_done.clone();
             // Background download thread
-            std::thread::spawn(move || {
+            let download_handle = std::thread::spawn(move || {
                 let rt = get_tokio_runtime();
                 let result = rt.block_on(manager.download(idx, &progress));
                 if result.is_err() {
@@ -480,8 +490,9 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 done_clone.store(true, Ordering::Relaxed);
                 drop(progress);
             });
+            state.download_thread_handle = Some(download_handle);
             // Ticker thread that periodically triggers poll_results
-            std::thread::spawn(move || {
+            let ticker_handle = std::thread::spawn(move || {
                 use std::time::Duration;
                 loop {
                     std::thread::sleep(Duration::from_millis(100));
@@ -493,6 +504,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                     }
                 }
             });
+            state.ticker_thread_handle = Some(ticker_handle);
             return Task::none();
         }
         Message::LoadModel(idx) => {
