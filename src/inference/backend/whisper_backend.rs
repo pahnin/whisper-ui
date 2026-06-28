@@ -50,15 +50,19 @@ impl WhisperBackend {
 
         let (ctx, accelerator) = match ctx {
             Ok(ctx) => {
-                let acc_name = if cfg!(target_os = "macos") {
+                let system_info = whisper_rs::print_system_info();
+                let acc_name = if system_info.contains("Metal") {
                     eprintln!("[WHISPER] Loaded model with Metal GPU acceleration");
                     "Metal".to_string()
-                } else if cfg!(target_os = "linux") {
-                    eprintln!("[WHISPER] Loaded model with GPU acceleration (CPU backend)");
-                    "CPU".to_string()
+                } else if system_info.contains("CUDA") {
+                    eprintln!("[WHISPER] Loaded model with CUDA GPU acceleration");
+                    "CUDA".to_string()
+                } else if system_info.contains("Vulkan") {
+                    eprintln!("[WHISPER] Loaded model with Vulkan GPU acceleration");
+                    "Vulkan".to_string()
                 } else {
-                    eprintln!("[WHISPER] Loaded model with GPU acceleration");
-                    "GPU".to_string()
+                    eprintln!("[WHISPER] Loaded model with CPU backend");
+                    "CPU".to_string()
                 };
                 (ctx, acc_name)
             }
