@@ -138,7 +138,6 @@ impl AppState {
     }
 
     pub fn init_backend(&mut self) -> Result<(), String> {
-        eprintln!("[APP] init_backend() START - selected_model_idx={}", self.selected_model_idx);
         let cache_dir = std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
             .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
@@ -152,7 +151,6 @@ impl AppState {
                 model.name
             ));
         }
-        eprintln!("[APP] init_backend() calling WhisperBackend::new()");
         let params = crate::inference::backend::BackendParams {
             language: Some(self.language.clone()),
             beam_size: 1,
@@ -160,7 +158,6 @@ impl AppState {
         };
         let backend = WhisperBackend::new(model.path.clone(), params)
             .map_err(|e| format!("Failed to load model: {}", e))?;
-        eprintln!("[APP] init_backend() WhisperBackend::new() returned, storing in self.backend");
         self.backend = Some(backend);
         Ok(())
     }
@@ -181,7 +178,8 @@ impl AppState {
     pub fn handle_transcription_result(&mut self, text: String) {
         if !text.is_empty() {
             let now = chrono::Utc::now().format("%M:%S");
-            self.temp_content.push_str(&format!("[{}] {}\n", now, text.trim()));
+            let formatted = format!("[{}] {}\n", now, text.trim());
+            self.temp_content.push_str(&formatted);
         }
     }
 
@@ -250,17 +248,12 @@ impl AppState {
 
   impl Drop for AppState {
     fn drop(&mut self) {
-        eprintln!("[APP] AppState::drop() called!");
         if let Some(ref mut audio) = self.audio_capture {
-            eprintln!("[APP] AppState::drop() stopping audio capture");
             audio.stop();
         }
         if let Some(handle) = self.worker_handle.take() {
-            eprintln!("[APP] AppState::drop() joining worker thread");
             let _ = handle.join();
-            eprintln!("[APP] AppState::drop() worker thread joined");
         }
-        eprintln!("[APP] AppState::drop() complete");
     }
 }
 
@@ -307,71 +300,55 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StartRecord => {
-            eprintln!("[APP] StartRecord message received, is_recording={}", state.is_recording);
             if state.is_recording {
-                eprintln!("[APP] StartRecord: already recording, returning");
                 return Task::none();
             }
             if state.downloading_model.is_some() {
                 state.error_message = Some("Cannot start recording while a model is downloading".to_string());
                 return Task::none();
             }
-            eprintln!("[APP] StartRecord: backend_ready={}, audio_capture={}", state.is_backend_ready(), state.audio_capture.is_some());
             state.is_recording = true;
             state.is_paused = false;
             if !state.is_backend_ready() {
-                eprintln!("[APP] StartRecord: backend not ready, calling init_backend()");
                 if let Err(e) = state.init_backend() {
-                    eprintln!("[APP] StartRecord: init_backend() failed: {}", e);
+                    eprintln!("[APP] Failed to load model: {}", e);
                     state.error_message = Some(e);
                     state.is_recording = false;
                     return Task::none();
                 }
-                eprintln!("[APP] StartRecord: init_backend() succeeded");
             }
             if state.audio_capture.is_none() {
-                eprintln!("[APP] StartRecord: audio_capture is None, calling init_audio()");
                 if let Err(e) = state.init_audio() {
-                    eprintln!("[APP] StartRecord: init_audio() failed: {}", e);
+                    eprintln!("[APP] Failed to init audio: {}", e);
                     state.error_message = Some(e);
                     state.is_recording = false;
                     return Task::none();
                 }
-                eprintln!("[APP] StartRecord: init_audio() succeeded");
             }
-            eprintln!("[APP] StartRecord: taking audio_capture and backend");
             let Some(mut audio) = state.audio_capture.take() else {
                 state.error_message = Some("Audio capture not initialized".to_string());
                 state.is_recording = false;
                 return Task::none();
             };
             let Some(backend) = state.backend.take() else {
-                eprintln!("[APP] StartRecord: backend was None, restoring audio");
                 state.audio_capture = Some(audio);
                 state.error_message = Some("Backend not initialized".to_string());
                 state.is_recording = false;
                 return Task::none();
             };
-            eprintln!("[APP] StartRecord: got backend and audio, starting audio stream");
 
             let (result_tx, result_rx) = std::sync::mpsc::channel();
-            eprintln!("[APP] StartRecord: created result channel");
             state.result_rx = Some(result_rx);
 
             match audio.start() {
                 Ok(()) => {
-                    eprintln!("[APP] StartRecord: audio started successfully");
                     let ring_buffer = audio.get_ring_buffer();
                     let running = audio.get_running();
-
                     let handle = worker::run_worker(ring_buffer, backend, result_tx, running);
-                    eprintln!("[APP] StartRecord: worker thread spawned, handle={:?}", std::ptr::addr_of!(handle).is_null());
                     state.worker_handle = Some(handle);
                     state.audio_capture = Some(audio);
-                    eprintln!("[APP] StartRecord: all setup complete");
                 }
                 Err(e) => {
-                    eprintln!("[APP] StartRecord: audio.start() failed: {}", e);
                     state.audio_capture = Some(audio);
                     state.error_message = Some(format!("Failed to start recording: {}", e));
                     state.is_recording = false;
@@ -380,30 +357,18 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StopRecord => {
-            eprintln!("[APP] StopRecord: is_recording={}, backend={:?}, worker_handle={:?}",
-                state.is_recording,
-                state.backend.is_some(),
-                state.worker_handle.is_some()
-            );
             state.is_recording = false;
             state.is_paused = false;
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
-            // Signal audio capture to stop (sets running = false)
             if let Some(mut audio) = state.audio_capture.take() {
-                eprintln!("[APP] StopRecord: stopping audio capture");
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
-            // Join worker thread BEFORE dropping backend
             if let Some(handle) = state.worker_handle.take() {
-                eprintln!("[APP] StopRecord: joining worker thread");
                 let _ = handle.join();
-                eprintln!("[APP] StopRecord: worker thread joined");
             }
-            // Now safe to drop backend
-            eprintln!("[APP] StopRecord: setting backend = None");
             state.backend = None;
         }
 
@@ -418,7 +383,9 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 state.handle_transcription_result(text);
                 // Debounced auto-save: only writes to disk every 2 seconds
                 // instead of on every transcription update.
-                state.auto_save_if_debounced();
+                if !state.temp_content.is_empty() {
+                    state.auto_save_if_debounced();
+                }
             }
         }
 
@@ -445,26 +412,17 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.show_settings = false;
         }
        Message::SaveSettings => {
-            eprintln!("[APP] SaveSettings: backend.is_none()={}, is_recording={}", state.backend.is_none(), state.is_recording);
             state.downloading_model = None;
             state.progress_rx = None;
             state.poll_tx = None;
             state.poll_rx = None;
             state.download_done.store(false, Ordering::Relaxed);
-            // Only reinitialize the backend if it hasn't been loaded yet.
-            // If recording is active, the backend is already running in the worker thread
-            // and re-initializing would cause double model load → memory corruption crash.
             if state.backend.is_none() {
-                eprintln!("[APP] SaveSettings: backend is None, calling init_backend()");
                 if let Err(e) = state.init_backend() {
-                    eprintln!("[APP] SaveSettings: init_backend() failed: {}", e);
                     state.model_status = ModelStatus::Error(e);
                 } else {
-                    eprintln!("[APP] SaveSettings: init_backend() succeeded");
                     state.model_status = ModelStatus::Ready;
                 }
-            } else {
-                eprintln!("[APP] SaveSettings: backend already exists, skipping init");
             }
             state.show_settings = false;
             let _ = save_app_state(state);

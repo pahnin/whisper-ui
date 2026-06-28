@@ -14,17 +14,13 @@ pub struct WhisperBackend {
 
 impl WhisperBackend {
     pub fn new(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
-        eprintln!("[WHISPER] new() START - model_path={:?}", model_path);
+        eprintln!("[WHISPER] Model loaded: {:?}", model_path);
         let whisper_params = whisper_rs::WhisperContextParameters::default();
-        eprintln!("[WHISPER] new() calling WhisperContext::new_with_params()");
         let ctx = WhisperContext::new_with_params(&model_path, whisper_params)
             .map_err(|e| BackendError::Internal(format!("Failed to load model: {}", e)))?;
-        eprintln!("[WHISPER] new() ctx created successfully");
-        eprintln!("[WHISPER] new() calling ctx.create_state()");
         let state = ctx
             .create_state()
             .map_err(|e| BackendError::Internal(format!("Failed to init state: {}", e)))?;
-        eprintln!("[WHISPER] new() state created successfully, returning WhisperBackend");
         Ok(Self {
             ctx,
             state,
@@ -39,9 +35,7 @@ impl WhisperBackend {
         &mut self,
         audio_data: &[f32],
     ) -> Result<TranscriptSegment, BackendError> {
-        eprintln!("[WHISPER] transcribe_segment_sync() START - audio_data.len()={}", audio_data.len());
         if audio_data.is_empty() {
-            eprintln!("[WHISPER] transcribe_segment_sync() returning early (empty audio)");
             return Ok(TranscriptSegment {
                 text: String::new(),
                 start: Duration::ZERO,
@@ -54,18 +48,25 @@ impl WhisperBackend {
         params.set_language(self.language.as_deref());
         params.set_n_threads(4);
 
-        eprintln!("[WHISPER] transcribe_segment_sync() calling state.full()");
         self.state
             .full(params, audio_data)
             .map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
-        eprintln!("[WHISPER] transcribe_segment_sync() state.full() done");
 
-        let mut text_parts = Vec::new();
+        let mut full_text = String::new();
         for segment in self.state.as_iter() {
-            text_parts.push(segment.to_str_lossy().unwrap_or_default().to_string());
+            let text = segment.to_str_lossy().unwrap_or_default();
+            if !text.is_empty() {
+                let start_ms = segment.start_timestamp();
+                let end_ms = segment.end_timestamp();
+                let start = format!("{:}:{:02}", start_ms / 60000, (start_ms % 60000) / 1000);
+                let end = format!("{:}:{:02}", end_ms / 60000, (end_ms % 60000) / 1000);
+                eprintln!("[WHISPER] [{}-{}] {}", start, end, text.trim());
+                if !full_text.is_empty() {
+                    full_text.push('\n');
+                }
+                full_text.push_str(&text);
+            }
         }
-
-        let full_text = text_parts.join("\n");
 
         let segment = TranscriptSegment {
             text: full_text,
@@ -73,7 +74,6 @@ impl WhisperBackend {
             end: Duration::ZERO,
         };
 
-        eprintln!("[WHISPER] transcribe_segment_sync() returning Ok(segment)");
         Ok(segment)
     }
 }
