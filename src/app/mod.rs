@@ -4,6 +4,7 @@ use iced::widget::{button, Column, Container, Row, Text};
 use iced::{Element, Length, Task};
 
 use crate::audio::capture::AudioCapture;
+use crate::document::TranscriptLine;
 use crate::inference::backend::whisper_backend::WhisperBackend;
 use crate::inference::backend::model_manager::ModelInfo;
 use crate::workspace::Workspace;
@@ -183,10 +184,15 @@ impl AppState {
 
     pub fn handle_transcription_result(&mut self, text: String) {
         if !text.is_empty() {
-            let now = chrono::Utc::now().format("%M:%S");
-            let formatted = format!("[{}] {}\n", now, text.trim());
+            let now = chrono::Local::now().format("%H:%M:%S");
+            let timestamp = format!("[{}] ", now);
+            let formatted = format!("{}{}\n", timestamp, text.trim());
             if let Some(doc) = self.workspace.active_mut() {
                 doc.content.push_str(&formatted);
+                doc.transcript_lines.push(TranscriptLine {
+                    timestamp,
+                    text: text.trim().to_string(),
+                });
                 doc.modified_at = chrono::Utc::now().timestamp();
                 let id = doc.id;
                 let _ = self.workspace.save(id);
@@ -604,7 +610,7 @@ pub fn view<'a>(
         &state.rename_input,
     );
     let active_doc = state.workspace.active();
-    let editor = crate::ui::editor::view(active_doc, "");
+    let editor = crate::ui::editor::view(active_doc);
     let controls = crate::ui::controls::view(
         state.is_recording,
         state.is_paused,

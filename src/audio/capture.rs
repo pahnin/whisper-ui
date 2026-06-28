@@ -66,7 +66,7 @@ impl AudioCapture {
                 &config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
                     if !data.is_empty() {
-                        if cfg!(debug_assertions) {
+                        if std::env::var("RUST_LOG").ok().is_some_and(|v| v.contains("debug")) {
                             eprintln!("[AUDIO] samples={}, timestamp={:?}", data.len(), info.timestamp());
                         }
                         if let Ok(mut rb) = ring_buffer.lock() {

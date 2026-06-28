@@ -4,7 +4,7 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::document::Document;
+use crate::document::{Document, TranscriptLine};
 
 const DOCUMENTS_DIR: &str = "documents";
 
@@ -40,10 +40,12 @@ impl Workspace {
                                     "Untitled".to_string()
                                 };
 
+                                let transcript_lines = TranscriptLine::parse_content(&content);
                                 documents.insert(doc_id, Document {
                                     id: doc_id,
                                     title: title.trim().to_string(),
                                     content,
+                                    transcript_lines,
                                     created_at: chrono::Utc::now().timestamp(),
                                     modified_at: chrono::Utc::now().timestamp(),
                                 });

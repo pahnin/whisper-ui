@@ -29,7 +29,11 @@ fn main() {
             .map(|h| std::path::PathBuf::from(h).join(".local/share/whisper-app"))
             .unwrap_or_else(|_| std::path::PathBuf::from("whisper-app-data"));
 
-        let workspace = crate::workspace::Workspace::load(&base_dir);
+        let mut workspace = crate::workspace::Workspace::load(&base_dir);
+
+        for doc in workspace.documents.values_mut() {
+            doc.parse_lines_from_content();
+        }
 
         let mut app_state = crate::app::AppState::default();
         app_state.workspace = workspace;
