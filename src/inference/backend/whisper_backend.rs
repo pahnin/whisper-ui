@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 use super::{BackendError, BackendParams, TranscriptSegment, TranscriptionBackend};
+
+static LOGGING_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 pub struct WhisperBackend {
     #[allow(dead_code)]
@@ -18,7 +21,7 @@ pub struct WhisperBackend {
 
 impl WhisperBackend {
     pub fn new(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
-        whisper_rs::install_logging_hooks();
+        LOGGING_INITIALIZED.get_or_init(|| whisper_rs::install_logging_hooks());
 
         let gpu_params = WhisperContextParameters::default();
         let ctx = WhisperContext::new_with_params(&model_path, gpu_params);
@@ -55,7 +58,7 @@ impl WhisperBackend {
     }
 
     pub fn new_cpu(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
-        whisper_rs::install_logging_hooks();
+        LOGGING_INITIALIZED.get_or_init(|| whisper_rs::install_logging_hooks());
         let whisper_params = WhisperContextParameters {
             use_gpu: false,
             ..WhisperContextParameters::default()
@@ -117,7 +120,7 @@ impl WhisperBackend {
 
         let mut all_text = String::new();
         for segment in self.state.as_iter() {
-            let text = segment.to_str_lossy().unwrap_or_default();
+            let text = segment.to_str_lossy().map_err(|e| BackendError::TranscriptionFailed(format!("segment to_str_lossy: {}", e)))?;
             eprintln!("[WHISPER RAW] '{}'", text.trim());
             if !text.is_empty() {
                 let trimmed = text.trim().to_string();

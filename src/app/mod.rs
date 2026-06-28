@@ -43,6 +43,8 @@ pub enum Message {
     RenameDocumentConfirm(String),
     ClearError,
     HideLanding,
+    LanguageSearch(String),
+    SaveComplete,
 }
 
 pub struct AppState {
@@ -73,6 +75,7 @@ pub struct AppState {
     pub rename_doc: Option<uuid::Uuid>,
     pub rename_input: String,
     pub show_landing: bool,
+    pub language_search: String,
     pub accelerator: Option<String>,
 }
 
@@ -106,6 +109,7 @@ impl Default for AppState {
             rename_doc: None,
             rename_input: String::new(),
             show_landing: false,
+            language_search: String::new(),
             language_options: Vec::new(),
             accelerator: None,
         }
@@ -191,39 +195,57 @@ impl AppState {
     }
 
     pub fn poll_results(&mut self) {
-        if let Some(rx) = self.result_rx.take() {
+        let results: Vec<TranscriptionResult> = if let Some(rx) = &self.result_rx {
+            let mut vec = Vec::new();
             while let Ok(result) = rx.try_recv() {
-                match result {
-                    TranscriptionResult::Segment(text) => {
-                        eprintln!("[APP] Received transcription result: '{}'", text);
-                        self.handle_transcription_result(text);
-                    }
-                    TranscriptionResult::Error(err) => {
-                        self.error_message = Some(err);
-                    }
+                vec.push(result);
+            }
+            vec
+        } else {
+            Vec::new()
+        };
+        for result in results {
+            match result {
+                TranscriptionResult::Segment(text) => {
+                    eprintln!("[APP] Received transcription result: '{}'", text);
+                    self.handle_transcription_result(text);
+                }
+                TranscriptionResult::Error(err) => {
+                    self.error_message = Some(err);
                 }
             }
-            self.result_rx = Some(rx);
         }
-        if let Some(rx) = self.level_rx.take() {
+        let levels: Vec<f32> = if let Some(rx) = &self.level_rx {
+            let mut vec = Vec::new();
             while let Ok(level) = rx.try_recv() {
-                self.audio_level = level;
+                vec.push(level);
             }
-            self.level_rx = Some(rx);
+            vec
+        } else {
+            Vec::new()
+        };
+        for level in levels {
+            self.audio_level = level;
         }
         if self.download_done.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(rx) = self.progress_rx.take() {
+        let progress: Vec<f32> = if let Some(rx) = &self.progress_rx {
+            let mut vec = Vec::new();
             while let Ok(pct) = rx.try_recv() {
-                if pct >= 0.0 {
-                    // Don't overwrite error state
-                    if !matches!(self.model_status, ModelStatus::Error(_)) {
-                        self.model_status = ModelStatus::Downloading(pct);
-                    }
+                vec.push(pct);
+            }
+            vec
+        } else {
+            Vec::new()
+        };
+        for pct in progress {
+            if pct >= 0.0 {
+                // Don't overwrite error state
+                if !matches!(self.model_status, ModelStatus::Error(_)) {
+                    self.model_status = ModelStatus::Downloading(pct);
                 }
             }
-            self.progress_rx = Some(rx);
         }
     }
 }
@@ -243,7 +265,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::NewDocument => {
             let id = state.workspace.new_document();
             state.active_id = Some(id);
-            let _ = save_app_state(state);
+            return save_app_state_task(state);
         }
         Message::SelectDocument(id) => {
             state.last_active_doc = state.active_id;
@@ -252,7 +274,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             }
             state.workspace.activate(id);
             state.active_id = Some(id);
-            let _ = save_app_state(state);
+            return save_app_state_task(state);
         }
         Message::DeleteDocument(id) => {
             state.workspace.delete_document(id);
@@ -364,16 +386,21 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::ShowSettings => {
             state.show_settings = true;
         }
-       Message::HideSettings => {
+        Message::LanguageSearch(query) => {
+            state.language_search = query;
+        }
+      Message::HideSettings => {
             state.downloading_model = None;
             state.progress_rx = None;
             state.download_done.store(false, Ordering::Relaxed);
+            state.language_search.clear();
             state.show_settings = false;
         }
-       Message::SaveSettings => {
+        Message::SaveSettings => {
             state.downloading_model = None;
             state.progress_rx = None;
             state.download_done.store(false, Ordering::Relaxed);
+            state.language_search.clear();
             if state.backend.is_none() {
                 if let Err(e) = state.init_backend() {
                     state.model_status = ModelStatus::Error(e);
@@ -382,7 +409,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 }
             }
             state.show_settings = false;
-            let _ = save_app_state(state);
+            return save_app_state_task(state);
         }
 
         Message::ModelDownloadProgress(pct) => {
@@ -415,13 +442,13 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                  } else {
                      state.model_status = ModelStatus::NotDownloaded;
                  }
-             }
-             let _ = save_app_state(state);
+          }
+              return save_app_state_task(state);
+          }
+         Message::LanguageChanged(lang) => {
+             state.language = lang;
+             return save_app_state_task(state);
          }
-        Message::LanguageChanged(lang) => {
-            state.language = lang;
-            let _ = save_app_state(state);
-        }
      Message::DownloadModel(idx) => {
             if state.downloading_model.is_some() {
                 return Task::none();
@@ -491,39 +518,39 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::HideLanding => {
             state.show_landing = false;
         }
+        Message::SaveComplete => {}
     }
     Task::none()
 }
 
-pub fn save_app_state(state: &AppState) -> Result<(), String> {
+pub fn save_app_state_task(state: &AppState) -> Task<Message> {
     let config_dir = std::env::var("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".local/share/whisper-app"))
         .unwrap_or_else(|_| std::path::PathBuf::from(".local/share/whisper-app"));
-    let config_path = config_dir.join("app_state.json");
+    let selected_model_idx = state.selected_model_idx;
+    let language = state.language.clone();
+    let last_active_doc = state.last_active_doc;
+    Task::perform(
+        async move {
+            #[derive(serde::Serialize)]
+            struct AppConfig {
+                selected_model_idx: usize,
+                language: String,
+                last_active_doc: Option<String>,
+            }
 
-    let last_active = state.last_active_doc.map(|id| id.to_string());
+            let config = AppConfig {
+                selected_model_idx,
+                language,
+                last_active_doc: last_active_doc.map(|id| id.to_string()),
+            };
 
-    #[derive(serde::Serialize)]
-    struct AppConfig {
-        selected_model_idx: usize,
-        language: String,
-        last_active_doc: Option<String>,
-    }
-
-    let config = AppConfig {
-        selected_model_idx: state.selected_model_idx,
-        language: state.language.clone(),
-        last_active_doc: last_active,
-    };
-
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize app state: {}", e))?;
-    fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create config dir: {}", e))?;
-    fs::write(config_path, json)
-        .map_err(|e| format!("Failed to save app state: {}", e))?;
-
-    Ok(())
+            let json = serde_json::to_string_pretty(&config).unwrap_or_default();
+            let _ = fs::create_dir_all(&config_dir);
+            let _ = fs::write(config_dir.join("app_state.json"), json);
+        },
+        |_| Message::SaveComplete,
+    )
 }
 
 pub fn load_app_state() -> (usize, String, Option<uuid::Uuid>) {
@@ -635,6 +662,7 @@ pub fn view<'a>(
         state.downloading_model,
         state.error_message.as_deref(),
         &state.language_options,
+        &state.language_search,
     );
 
     let main_content = Column::new()
@@ -664,12 +692,14 @@ pub fn view<'a>(
         with_landing
     };
 
-    if let Some(settings_elem) = settings {
-        Column::new()
-            .push(with_error)
-            .push(settings_elem)
+    let with_settings = if let Some(settings_elem) = settings {
+        Container::new(iced::widget::stack![with_error, settings_elem])
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     } else {
         with_error
-    }
+    };
+
+    with_settings
 }

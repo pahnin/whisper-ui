@@ -1,4 +1,4 @@
-use iced::widget::{button, Column, Container, Row, Scrollable, Text};
+use iced::widget::{button, Column, Container, Row, Scrollable, Text, TextInput};
 use iced::widget::container;
 use iced::{Element, Length};
 
@@ -48,9 +48,10 @@ fn build_settings_content<'a>(
     language: &'a str,
     language_options: &'a [(String, String)],
     backend_ready: bool,
+    language_search: &'a str,
 ) -> Column<'a, Message> {
     let model_list = build_model_list(models, selected_idx, downloading_model, model_status, backend_ready);
-    let lang_list = build_lang_list(language, language_options);
+    let lang_section = build_lang_section(language, language_options, language_search);
     let status = build_status_text(model_status, backend_ready);
     let buttons = build_buttons(selected_idx, backend_ready);
 
@@ -63,16 +64,30 @@ fn build_settings_content<'a>(
                 .push(Text::new("Model").size(14))
                 .push(model_list),
         )
-        .push(
-            Column::new()
-                .spacing(4)
-                .push(Text::new("Language").size(14))
-                .push(lang_list),
-        )
+        .push(lang_section)
         .push(status)
         .push(buttons)
         .padding(24)
         .width(500)
+}
+
+fn build_lang_section<'a>(
+    language: &'a str,
+    language_options: &'a [(String, String)],
+    language_search: &'a str,
+) -> Column<'a, Message> {
+    let search_input = TextInput::new("Search languages...", language_search)
+        .on_input(Message::LanguageSearch)
+        .size(13)
+        .padding([3, 8]);
+
+    let lang_list = build_lang_list(language, language_options, language_search);
+
+    Column::new()
+        .spacing(4)
+        .push(Text::new("Language").size(14))
+        .push(search_input)
+        .push(lang_list)
 }
 
 pub fn view<'a>(
@@ -85,12 +100,13 @@ pub fn view<'a>(
     downloading_model: Option<usize>,
     error_message: Option<&'a str>,
     language_options: &'a [(String, String)],
+    language_search: &'a str,
 ) -> Option<Element<'a, Message>> {
     if !show {
         return None;
     }
 
-    let panel_content = build_settings_content(models, selected_idx, downloading_model, model_status, language, language_options, backend_ready);
+    let panel_content = build_settings_content(models, selected_idx, downloading_model, model_status, language, language_options, backend_ready, language_search);
     let panel = Container::new(panel_content)
         .width(500)
         .height(Length::Shrink)
@@ -224,29 +240,50 @@ fn build_model_list<'a>(
     .into()
 }
 
-fn build_lang_list<'a>(language: &'a str, language_options: &'a [(String, String)]) -> Element<'a, Message> {
-    let list: Column<'a, Message> = language_options
+fn build_lang_list<'a>(language: &'a str, language_options: &'a [(String, String)], search: &'a str) -> Element<'a, Message> {
+    let search_lower = search.to_lowercase();
+    let filtered: Vec<&(String, String)> = language_options
         .iter()
-        .fold(Column::new().spacing(2), |col, (code, full_name)| {
-            let label = if code == language {
-                format!("▸ {}", full_name)
+        .filter(|(code, full_name)| {
+            if search.is_empty() {
+                true
             } else {
-                format!("  {}", full_name)
-            };
-            let item: Element<'a, Message> = button(Text::new(label))
-                .on_press(Message::LanguageChanged(code.clone()))
-                .into();
-            col.push(item)
-        });
+                let code_match = code.to_lowercase().contains(&search_lower);
+                let name_match = full_name.to_lowercase().contains(&search_lower);
+                code_match || name_match
+            }
+        })
+        .collect();
 
-    Container::new(
-        Scrollable::new(list)
+    if filtered.is_empty() && !search.is_empty() {
+        Container::new(Text::new("No matching languages").size(13))
             .width(Length::Fill)
-            .height(150),
-    )
-    .width(Length::Fill)
-    .height(150)
-    .into()
+            .height(150)
+            .into()
+    } else {
+        let list: Column<'a, Message> = filtered
+            .iter()
+            .fold(Column::new().spacing(2), |col, (code, full_name)| {
+                let label = if code.as_str() == language {
+                    format!("▸ {}", full_name)
+                } else {
+                    format!("  {}", full_name)
+                };
+                let item: Element<'a, Message> = button(Text::new(label))
+                    .on_press(Message::LanguageChanged(code.clone()))
+                    .into();
+                col.push(item)
+            });
+
+        Container::new(
+            Scrollable::new(list)
+                .width(Length::Fill)
+                .height(150),
+        )
+        .width(Length::Fill)
+        .height(150)
+        .into()
+    }
 }
 
 fn build_status_text(model_status: &ModelStatus, backend_ready: bool) -> Element<'_, Message> {

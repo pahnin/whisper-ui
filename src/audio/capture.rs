@@ -64,8 +64,11 @@ impl AudioCapture {
         let stream = device
             .build_input_stream::<f32, _, _>(
                 &config,
-                move |data: &[f32], _: &_| {
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
                     if !data.is_empty() {
+                        if cfg!(debug_assertions) {
+                            eprintln!("[AUDIO] samples={}, timestamp={:?}", data.len(), info.timestamp());
+                        }
                         if let Ok(mut rb) = ring_buffer.lock() {
                             let available = rb.capacity() - rb.len();
                             if available > 0 {
