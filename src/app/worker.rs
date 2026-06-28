@@ -12,15 +12,13 @@ use crate::inference::backend::WhisperBackend;
 const SAMPLE_RATE: u32 = 16_000;
 
 /// Minimum audio to accumulate before transcribing (4 seconds).
-/// Whisper needs 2-3+ seconds for reliable transcription of complete sentences.
 const MIN_AUDIO_SECS: u64 = 4;
 
 /// Overlap between consecutive chunks (2 seconds).
-/// Prevents words from being cut at chunk boundaries.
 const OVERLAP_SECS: u64 = 2;
 
-/// How often to check the ring buffer for accumulated audio (200ms).
-const POLL_INTERVAL_MS: u64 = 200;
+/// Poll interval for checking ring buffer (50ms, reduced from 200ms).
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Runs the transcription pipeline on a dedicated thread.
 /// Accumulates audio until MIN_AUDIO_SECS has elapsed, then transcribes
@@ -39,9 +37,10 @@ pub fn run_worker(
         let mut flush_offset: usize = 0;
         let mut next_flush_at: usize = min_samples;
 
+        let (_wake_tx, wake_rx): (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) = std::sync::mpsc::channel();
+
         loop {
             let running = running.load(Ordering::SeqCst);
-            eprintln!("[WORKER] Loop iteration, running={}", running);
             if !running {
                 break;
             }
@@ -62,7 +61,6 @@ pub fn run_worker(
             }
 
             if !drained.is_empty() {
-                eprintln!("[WORKER] Drained {} samples from ring buffer (total: {})", drained.len(), recent_audio.len() + drained.len());
                 recent_audio.extend(drained);
             }
 
@@ -81,7 +79,6 @@ pub fn run_worker(
                 match backend.transcribe_segment_sync(&chunk) {
                     Ok(segment) => {
                         if !segment.text.is_empty() {
-                            eprintln!("[WORKER] Sending result: '{}'", segment.text);
                             if let Err(e) = result_tx.send(TranscriptionResult::Segment(segment.text)) {
                                 eprintln!("[WORKER] Failed to send transcription result: {}", e);
                                 break;
@@ -97,21 +94,24 @@ pub fn run_worker(
                     }
                 }
 
-                // Advance flush window: new overlap becomes the overlap we just used
+                // Advance flush window
                 flush_offset = chunk_end - overlap_samples;
                 next_flush_at = flush_offset + min_samples;
 
-                // Trim old audio from buffer (keep overlap + room for new accumulation)
+                // Trim old audio from buffer
                 if flush_offset > overlap_samples * 2 {
                     let trim_amount = flush_offset - overlap_samples;
                     recent_audio.drain(..trim_amount);
-                    // Adjust offsets
                     flush_offset -= trim_amount;
                     next_flush_at -= trim_amount;
                 }
             }
 
-            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            // Use recv_timeout for interruptible sleep — reduces shutdown latency from 200ms to 50ms
+            match wake_rx.recv_timeout(POLL_INTERVAL) {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
         }
     })
 }

@@ -4,6 +4,7 @@ use iced::widget::{button, Column, Container, Row, Text};
 use iced::{Element, Length, Task};
 
 use crate::audio::capture::AudioCapture;
+use crate::config;
 use crate::document::TranscriptLine;
 use crate::inference::backend::whisper_backend::WhisperBackend;
 use crate::inference::backend::model_manager::ModelInfo;
@@ -119,17 +120,13 @@ impl Default for AppState {
 
 impl AppState {
     pub fn load_models(&mut self) {
-        let cache_dir = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
-            .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
+        let cache_dir = config::cache_dir().join("models");
         let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
         self.models = manager.available_models().to_vec();
     }
 
     pub fn init_backend(&mut self) -> Result<(), String> {
-        let cache_dir = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
-            .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
+        let cache_dir = config::cache_dir().join("models");
         let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
         let model = manager
             .get_model_by_index(self.selected_model_idx)
@@ -261,8 +258,12 @@ impl AppState {
         if let Some(ref mut audio) = self.audio_capture {
             audio.stop();
         }
-        self.worker_handle.take();
-        self.download_thread_handle.take();
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.download_thread_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -466,9 +467,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.progress_rx = Some(progress_rx);
             state.download_done = download_done.clone();
             let progress = crate::inference::backend::model_manager::ProgressSender::new(progress_tx);
-            let cache_dir = std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
-                .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
+            let cache_dir = config::cache_dir().join("models");
             let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
             let done_clone = download_done.clone();
             // Background download thread
@@ -530,9 +529,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
 }
 
 pub fn save_app_state_task(state: &AppState) -> Task<Message> {
-    let config_dir = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".local/share/whisper-app"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".local/share/whisper-app"));
+    let config_dir = config::config_dir();
     let selected_model_idx = state.selected_model_idx;
     let language = state.language.clone();
     let last_active_doc = state.last_active_doc;
@@ -560,9 +557,7 @@ pub fn save_app_state_task(state: &AppState) -> Task<Message> {
 }
 
 pub fn load_app_state() -> (usize, String, Option<uuid::Uuid>) {
-    let config_dir = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".local/share/whisper-app"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".local/share/whisper-app"));
+    let config_dir = config::config_dir();
     let config_path = config_dir.join("app_state.json");
 
     if !config_path.exists() {

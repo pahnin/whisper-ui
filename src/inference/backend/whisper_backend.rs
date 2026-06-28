@@ -21,6 +21,28 @@ pub struct WhisperBackend {
 
 impl WhisperBackend {
     pub fn new(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
+        if !model_path.exists() {
+            return Err(BackendError::Internal(format!(
+                "Model file not found: {}",
+                model_path.display()
+            )));
+        }
+        let metadata = std::fs::metadata(&model_path).map_err(|e| {
+            BackendError::Internal(format!("Cannot read model file: {}", e))
+        })?;
+        if !metadata.is_file() {
+            return Err(BackendError::Internal(format!(
+                "Model path is not a file: {}",
+                model_path.display()
+            )));
+        }
+        if metadata.len() < 1_000_000 {
+            return Err(BackendError::Internal(format!(
+                "Model file too small ({} bytes), may be corrupted: {}",
+                metadata.len(),
+                model_path.display()
+            )));
+        }
         LOGGING_INITIALIZED.get_or_init(|| whisper_rs::install_logging_hooks());
 
         let gpu_params = WhisperContextParameters::default();
@@ -28,8 +50,17 @@ impl WhisperBackend {
 
         let (ctx, accelerator) = match ctx {
             Ok(ctx) => {
-                eprintln!("[WHISPER] Loaded model with GPU acceleration");
-                (ctx, "GPU".to_string())
+                let acc_name = if cfg!(target_os = "macos") {
+                    eprintln!("[WHISPER] Loaded model with Metal GPU acceleration");
+                    "Metal".to_string()
+                } else if cfg!(target_os = "linux") {
+                    eprintln!("[WHISPER] Loaded model with GPU acceleration (CPU backend)");
+                    "CPU".to_string()
+                } else {
+                    eprintln!("[WHISPER] Loaded model with GPU acceleration");
+                    "GPU".to_string()
+                };
+                (ctx, acc_name)
             }
             Err(e) => {
                 eprintln!("[WHISPER] GPU init failed ({}), falling back to CPU", e);
@@ -58,6 +89,28 @@ impl WhisperBackend {
     }
 
     pub fn new_cpu(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
+        if !model_path.exists() {
+            return Err(BackendError::Internal(format!(
+                "Model file not found: {}",
+                model_path.display()
+            )));
+        }
+        let metadata = std::fs::metadata(&model_path).map_err(|e| {
+            BackendError::Internal(format!("Cannot read model file: {}", e))
+        })?;
+        if !metadata.is_file() {
+            return Err(BackendError::Internal(format!(
+                "Model path is not a file: {}",
+                model_path.display()
+            )));
+        }
+        if metadata.len() < 1_000_000 {
+            return Err(BackendError::Internal(format!(
+                "Model file too small ({} bytes), may be corrupted: {}",
+                metadata.len(),
+                model_path.display()
+            )));
+        }
         LOGGING_INITIALIZED.get_or_init(|| whisper_rs::install_logging_hooks());
         let whisper_params = WhisperContextParameters {
             use_gpu: false,
@@ -93,24 +146,25 @@ impl WhisperBackend {
             });
         }
 
-        eprintln!("[WHISPER CHUNK] {} samples ({:.2}s)", audio_data.len(), audio_data.len() as f64 / 16000.0);
+        if std::env::var("WHISPER_DEBUG").is_ok() {
+            eprintln!("[WHISPER CHUNK] {} samples ({:.2}s)", audio_data.len(), audio_data.len() as f64 / 16000.0);
+        }
 
         let strategy = SamplingStrategy::Greedy { best_of: 1 };
         let mut params = FullParams::new(strategy);
         params.set_language(self.language.as_deref());
         params.set_n_threads(4);
-        // Enable Whisper's native context retention — carries forward the
-        // decoder's KV-cache so each chunk benefits from previous decoding state.
         params.set_no_context(false);
 
-        // Use last 150 chars as initial prompt for linguistic context.
         if !self.accumulated_text.is_empty() {
             let prompt = if self.accumulated_text.len() > 150 {
                 &self.accumulated_text[self.accumulated_text.len() - 150..]
             } else {
                 &self.accumulated_text
             };
-            eprintln!("[WHISPER PROMPT] '{}'", prompt);
+            if std::env::var("WHISPER_DEBUG").is_ok() {
+                eprintln!("[WHISPER PROMPT] '{}'", prompt);
+            }
             params.set_initial_prompt(prompt);
         }
 
@@ -121,7 +175,9 @@ impl WhisperBackend {
         let mut all_text = String::new();
         for segment in self.state.as_iter() {
             let text = segment.to_str_lossy().map_err(|e| BackendError::TranscriptionFailed(format!("segment to_str_lossy: {}", e)))?;
-            eprintln!("[WHISPER RAW] '{}'", text.trim());
+            if std::env::var("WHISPER_DEBUG").is_ok() {
+                eprintln!("[WHISPER RAW] '{}'", text.trim());
+            }
             if !text.is_empty() {
                 let trimmed = text.trim().to_string();
                 if !all_text.is_empty() {
@@ -141,14 +197,18 @@ impl WhisperBackend {
                     self.accumulated_text.push(' ');
                 }
                 self.accumulated_text.push_str(trimmed_new);
-                eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
-            } else {
+                if std::env::var("WHISPER_DEBUG").is_ok() {
+                    eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
+                }
+            } else if std::env::var("WHISPER_DEBUG").is_ok() {
                 eprintln!("[WHISPER DUPLICATE] Skipped (already in accumulated)");
             }
         }
 
         if !all_text.is_empty() {
-            eprintln!("[WHISPER] {}", all_text);
+            if std::env::var("WHISPER_DEBUG").is_ok() {
+                eprintln!("[WHISPER] {}", all_text);
+            }
         }
 
         let segment = TranscriptSegment {

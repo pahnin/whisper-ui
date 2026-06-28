@@ -1,9 +1,10 @@
 pub mod app;
-pub mod document;
-pub mod workspace;
-pub mod inference;
 pub mod audio;
+pub mod config;
+pub mod document;
+pub mod inference;
 pub mod ui;
+pub mod workspace;
 
 fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::Message> {
     let poll_recording = if state.is_recording {
@@ -25,9 +26,7 @@ fn main() {
     let language_options = crate::inference::backend::model_manager::ModelManager::language_options();
 
     let boot = move || {
-        let base_dir = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".local/share/whisper-app"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("whisper-app-data"));
+        let base_dir = crate::config::config_dir();
 
         let mut workspace = crate::workspace::Workspace::load(&base_dir);
 

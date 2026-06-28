@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
@@ -61,6 +63,8 @@ pub struct ModelManager {
     models: Vec<ModelInfo>,
 }
 
+const DOWNLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
 impl ModelManager {
     pub fn new(cache_dir: PathBuf) -> Self {
         let models = MODEL_NAMES
@@ -119,14 +123,16 @@ impl ModelManager {
             .map_err(|e| format!("Download failed: {}", e))?;
 
         let total_size = response.content_length().unwrap_or(model.size_bytes as u64);
+        let temp_path = self.cache_dir.join(format!(".{}.tmp", model.filename));
+        let file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let mut writer = BufWriter::with_capacity(DOWNLOAD_BUFFER_SIZE, file);
         let mut downloaded: u64 = 0;
-        let mut buffer = Vec::with_capacity(model.size_bytes);
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
             downloaded += bytes.len() as u64;
-            buffer.extend_from_slice(&bytes);
+            writer.write_all(&bytes).map_err(|e| format!("Failed to write chunk: {}", e))?;
 
             let progress_pct = if total_size > 0 {
                 (downloaded as f32 / total_size as f32) * 100.0
@@ -137,8 +143,8 @@ impl ModelManager {
             progress.send(progress_pct);
         }
 
-        let temp_path = self.cache_dir.join(format!(".{}.tmp", model.filename));
-        fs::write(&temp_path, &buffer).map_err(|e| format!("Failed to save model: {}", e))?;
+        writer.flush().map_err(|e| format!("Failed to flush writer: {}", e))?;
+        drop(writer);
         let output_path = self.cache_dir.join(&model.filename);
         fs::rename(&temp_path, &output_path).map_err(|e| format!("Failed to finalize model: {}", e))?;
 
