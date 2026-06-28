@@ -33,8 +33,6 @@ pub enum Message {
     NewDocument,
     SelectDocument(uuid::Uuid),
     DeleteDocument(uuid::Uuid),
-    ContentChangedTemp(String),
-    CommitContent,
     StartRecord,
     StopRecord,
     ResumeRecord,
@@ -49,12 +47,13 @@ pub enum Message {
     ModelSelected(usize),
     LanguageChanged(String),
     DownloadModel(usize),
+    LoadModel(usize),
     InitBackend,
+    BackendInitError(String),
     PollResults,
     PollTrigger,
     RenameDocument(uuid::Uuid),
     RenameDocumentConfirm(String),
-    AppendTranscript,
     ClearError,
     HideLanding,
 }
@@ -66,7 +65,6 @@ pub struct AppState {
     pub audio_capture: Option<AudioCapture>,
     pub backend: Option<WhisperBackend>,
     pub worker_handle: Option<std::thread::JoinHandle<()>>,
-    pub temp_content: String,
     pub is_recording: bool,
     pub is_paused: bool,
     pub audio_level: f32,
@@ -74,6 +72,7 @@ pub struct AppState {
     pub selected_model_idx: usize,
     pub models: Vec<ModelInfo>,
     pub model_status: ModelStatus,
+    pub model_loaded: bool,
     pub language: String,
     pub language_options: Vec<(String, String)>,
     pub result_rx: Option<std::sync::mpsc::Receiver<TranscriptionResult>>,
@@ -86,10 +85,8 @@ pub struct AppState {
     pub error_message: Option<String>,
     pub rename_doc: Option<uuid::Uuid>,
     pub rename_input: String,
-    pub append_mode: bool,
     pub show_landing: bool,
-    /// Tracks the last time we saved the active document (for debounced auto-save).
-    pub last_save_time: Option<std::time::Instant>,
+    pub accelerator: Option<String>,
 }
 
 impl Default for AppState {
@@ -101,14 +98,14 @@ impl Default for AppState {
             audio_capture: None,
             backend: None,
             worker_handle: None,
-            temp_content: String::new(),
             is_recording: false,
             is_paused: false,
             audio_level: 0.0,
             show_settings: false,
-            selected_model_idx: 0,
+            selected_model_idx: 1,
             models: Vec::new(),
             model_status: ModelStatus::NotDownloaded,
+            model_loaded: false,
             language: "en".to_string(),
             result_rx: None,
             level_rx: None,
@@ -120,10 +117,9 @@ impl Default for AppState {
             error_message: None,
             rename_doc: None,
             rename_input: String::new(),
-            append_mode: false,
             show_landing: false,
-            last_save_time: None,
             language_options: Vec::new(),
+            accelerator: None,
         }
     }
 }
@@ -156,10 +152,28 @@ impl AppState {
             beam_size: 1,
             vad_enabled: false,
         };
-        let backend = WhisperBackend::new(model.path.clone(), params)
-            .map_err(|e| format!("Failed to load model: {}", e))?;
-        self.backend = Some(backend);
-        Ok(())
+        match WhisperBackend::new(model.path.clone(), params) {
+            Ok(backend) => {
+                self.accelerator = Some(backend.accelerator.clone());
+                self.backend = Some(backend);
+                self.model_loaded = true;
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[APP] Backend init failed, falling back to CPU: {}", e);
+                let cpu_params = crate::inference::backend::BackendParams {
+                    language: Some(self.language.clone()),
+                    beam_size: 1,
+                    vad_enabled: false,
+                };
+                let backend = WhisperBackend::new_cpu(model.path.clone(), cpu_params)
+                    .map_err(|e| format!("Failed to load model (CPU fallback): {}", e))?;
+                self.accelerator = Some("CPU".to_string());
+                self.backend = Some(backend);
+                self.model_loaded = true;
+                Ok(())
+            }
+        }
     }
 
     pub fn init_audio(&mut self) -> Result<(), String> {
@@ -179,74 +193,59 @@ impl AppState {
         if !text.is_empty() {
             let now = chrono::Utc::now().format("%M:%S");
             let formatted = format!("[{}] {}\n", now, text.trim());
-            self.temp_content.push_str(&formatted);
+            if let Some(doc) = self.workspace.active_mut() {
+                doc.content.push_str(&formatted);
+                doc.modified_at = chrono::Utc::now().timestamp();
+                let id = doc.id;
+                let _ = self.workspace.save(id);
+            }
         }
     }
 
     pub fn poll_results(&mut self) {
-         if let Some(rx) = self.result_rx.take() {
-             while let Ok(result) = rx.try_recv() {
-                 match result {
-                     TranscriptionResult::Segment(text) => {
-                         self.handle_transcription_result(text);
-                     }
-                     TranscriptionResult::Error(err) => {
-                         self.error_message = Some(err);
-                     }
-                 }
-             }
-             self.result_rx = Some(rx);
-         }
-         if let Some(rx) = self.level_rx.take() {
-              while let Ok(level) = rx.try_recv() {
-                  self.audio_level = level;
-              }
-              self.level_rx = Some(rx);
-          }
+        if let Some(rx) = self.result_rx.take() {
+            while let Ok(result) = rx.try_recv() {
+                match result {
+                    TranscriptionResult::Segment(text) => {
+                        self.handle_transcription_result(text);
+                    }
+                    TranscriptionResult::Error(err) => {
+                        self.error_message = Some(err);
+                    }
+                }
+            }
+            self.result_rx = Some(rx);
+        }
+        if let Some(rx) = self.level_rx.take() {
+            while let Ok(level) = rx.try_recv() {
+                self.audio_level = level;
+            }
+            self.level_rx = Some(rx);
+        }
         if self.download_done.load(Ordering::Relaxed) {
-              return;
-          }
-          if let Some(rx) = self.progress_rx.take() {
-              while let Ok(pct) = rx.try_recv() {
-                  if pct >= 0.0 {
-                      // Don't overwrite error state
-                      if !matches!(self.model_status, ModelStatus::Error(_)) {
-                          self.model_status = ModelStatus::Downloading(pct);
-                      }
-                  }
-              }
-              self.progress_rx = Some(rx);
-          }
-          if let Some(rx) = self.poll_rx.take() {
-              while let Ok(()) = rx.try_recv() {
-                  // Just draining
-              }
-              self.poll_rx = Some(rx);
-          }
-      }
-
-     /// Debounced auto-save: saves the active document only if more than
-     /// SAVE_DEBOUNCE_SECONDS have passed since the last save. This prevents
-     /// excessive disk writes during rapid transcription updates.
-     pub fn auto_save_if_debounced(&mut self) {
-         let debounce = std::time::Duration::from_secs(2);
-         let now = std::time::Instant::now();
-
-         let should_save = match self.last_save_time {
-             None => true,
-             Some(last) => now.duration_since(last) >= debounce,
-         };
-
-         if should_save {
-             if let Some(id) = self.active_id {
-                 let _ = self.workspace.save(id);
-             }
-             self.last_save_time = Some(now);
-         }
-      }
+            return;
+        }
+        if let Some(rx) = self.progress_rx.take() {
+            while let Ok(pct) = rx.try_recv() {
+                if pct >= 0.0 {
+                    // Don't overwrite error state
+                    if !matches!(self.model_status, ModelStatus::Error(_)) {
+                        self.model_status = ModelStatus::Downloading(pct);
+                    }
+                }
+            }
+            self.progress_rx = Some(rx);
+        }
+        if let Some(rx) = self.poll_rx.take() {
+            while let Ok(()) = rx.try_recv() {
+                // Just draining
+            }
+            self.poll_rx = Some(rx);
+        }
+    }
 }
 
-  impl Drop for AppState {
+impl Drop for AppState {
     fn drop(&mut self) {
         if let Some(ref mut audio) = self.audio_capture {
             audio.stop();
@@ -264,7 +263,6 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::NewDocument => {
             let id = state.workspace.new_document();
             state.active_id = Some(id);
-            state.temp_content.clear();
             let _ = save_app_state(state);
         }
         Message::SelectDocument(id) => {
@@ -274,31 +272,11 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             }
             state.workspace.activate(id);
             state.active_id = Some(id);
-            if let Some(doc) = state.workspace.active() {
-                state.temp_content = doc.content.clone();
-            }
             let _ = save_app_state(state);
         }
         Message::DeleteDocument(id) => {
             state.workspace.delete_document(id);
-            if let Some(doc) = state.workspace.active() {
-                state.temp_content = doc.content.clone();
-            } else {
-                state.temp_content.clear();
-            }
         }
-        Message::ContentChangedTemp(text) => {
-            state.temp_content = text;
-        }
-        Message::CommitContent => {
-            if let Some(doc) = state.workspace.active_mut() {
-                doc.content = state.temp_content.clone();
-            }
-            if let Some(id) = state.active_id {
-                let _ = state.workspace.save(id);
-            }
-        }
-
         Message::StartRecord => {
             if state.is_recording {
                 return Task::none();
@@ -306,6 +284,10 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             if state.downloading_model.is_some() {
                 state.error_message = Some("Cannot start recording while a model is downloading".to_string());
                 return Task::none();
+            }
+            if state.workspace.documents.is_empty() {
+                let id = state.workspace.new_document();
+                state.active_id = Some(id);
             }
             state.is_recording = true;
             state.is_paused = false;
@@ -369,7 +351,11 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             if let Some(handle) = state.worker_handle.take() {
                 let _ = handle.join();
             }
-            state.backend = None;
+            state.poll_results();
+            if state.selected_model_idx < state.models.len()
+                && state.models[state.selected_model_idx].downloaded {
+                let _ = state.init_backend();
+            }
         }
 
         Message::ResumeRecord => {
@@ -381,11 +367,6 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 state.error_message = Some(text.trim_start_matches("[Error]").trim().to_string());
             } else {
                 state.handle_transcription_result(text);
-                // Debounced auto-save: only writes to disk every 2 seconds
-                // instead of on every transcription update.
-                if !state.temp_content.is_empty() {
-                    state.auto_save_if_debounced();
-                }
             }
         }
 
@@ -440,26 +421,31 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.download_done.store(true, Ordering::Relaxed);
             state.load_models();
         }
-      Message::ModelDownloadError(err) => {
-            state.downloading_model = None;
-            state.progress_rx = None;
-            state.poll_tx = None;
-            state.poll_rx = None;
-            state.download_done.store(true, Ordering::Relaxed);
-            state.model_status = ModelStatus::Error(err);
-        }
-       Message::ModelSelected(idx) => {
-            state.selected_model_idx = idx;
-            if idx < state.models.len() {
-                let downloaded = state.models[idx].downloaded;
-                if downloaded {
-                    state.model_status = ModelStatus::Ready;
-                } else {
-                    state.model_status = ModelStatus::NotDownloaded;
-                }
-            }
-            let _ = save_app_state(state);
-        }
+     Message::ModelDownloadError(err) => {
+             state.downloading_model = None;
+             state.progress_rx = None;
+             state.poll_tx = None;
+             state.poll_rx = None;
+             state.download_done.store(true, Ordering::Relaxed);
+             state.model_status = ModelStatus::Error(err);
+         }
+        Message::BackendInitError(err) => {
+             state.error_message = Some(err);
+         }
+  Message::ModelSelected(idx) => {
+             state.selected_model_idx = idx;
+             if idx < state.models.len() {
+                 if state.models[idx].downloaded {
+                     state.model_status = ModelStatus::Ready;
+                     if state.is_backend_ready() {
+                         state.model_loaded = true;
+                     }
+                 } else {
+                     state.model_status = ModelStatus::NotDownloaded;
+                 }
+             }
+             let _ = save_app_state(state);
+         }
         Message::LanguageChanged(lang) => {
             state.language = lang;
             let _ = save_app_state(state);
@@ -511,10 +497,18 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             });
             return Task::none();
         }
+        Message::LoadModel(idx) => {
+            state.selected_model_idx = idx;
+            if let Err(e) = state.init_backend() {
+                state.model_status = ModelStatus::Error(e);
+            } else {
+                state.model_status = ModelStatus::Ready;
+            }
+        }
         Message::InitBackend => {
             if let Err(e) = state.init_backend() {
                 return Task::perform(
-                    async move { Message::ModelDownloadError(e) },
+                    async move { Message::BackendInitError(e) },
                     |msg| msg,
                 );
             }
@@ -534,23 +528,6 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 }
                 if let Some(doc) = state.workspace.documents.get(&id) {
                     state.rename_input = doc.title.clone();
-                }
-            }
-        }
-        Message::AppendTranscript => {
-            if !state.temp_content.is_empty() {
-                if let Some(doc) = state.workspace.active_mut() {
-                    if !doc.content.is_empty() && !doc.content.ends_with('\n') {
-                        doc.content.push('\n');
-                    }
-                    doc.content.push_str(&state.temp_content);
-                    doc.modified_at = chrono::Utc::now().timestamp();
-                }
-                state.temp_content.clear();
-                state.append_mode = false;
-                if let Some(id) = state.active_id {
-                    let _ = state.workspace.save(id);
-                    let _ = save_app_state(&state);
                 }
             }
         }
@@ -646,12 +623,13 @@ pub fn view<'a>(
         &state.rename_input,
     );
     let active_doc = state.workspace.active();
-    let editor = crate::ui::editor::view(active_doc, &state.temp_content, state.append_mode);
+    let editor = crate::ui::editor::view(active_doc, "");
     let controls = crate::ui::controls::view(
         state.is_recording,
         state.is_paused,
         state.audio_level,
-        state.is_backend_ready(),
+        state.model_loaded,
+        state.accelerator.as_deref(),
     );
 
     let error_bar: Option<Element<'a, Message>> = if let Some(ref err) = state.error_message {

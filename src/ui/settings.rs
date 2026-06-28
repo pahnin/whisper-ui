@@ -47,11 +47,12 @@ fn build_settings_content<'a>(
     model_status: &'a ModelStatus,
     language: &'a str,
     language_options: &'a [(String, String)],
+    backend_ready: bool,
 ) -> Column<'a, Message> {
-    let model_list = build_model_list(models, selected_idx, downloading_model, model_status);
+    let model_list = build_model_list(models, selected_idx, downloading_model, model_status, backend_ready);
     let lang_list = build_lang_list(language, language_options);
-    let status = build_status_text(model_status);
-    let buttons = build_buttons();
+    let status = build_status_text(model_status, backend_ready);
+    let buttons = build_buttons(selected_idx, backend_ready);
 
     Column::new()
         .spacing(16)
@@ -80,7 +81,7 @@ pub fn view<'a>(
     selected_idx: usize,
     language: &'a str,
     model_status: &'a ModelStatus,
-    _backend_ready: bool,
+    backend_ready: bool,
     downloading_model: Option<usize>,
     error_message: Option<&'a str>,
     language_options: &'a [(String, String)],
@@ -89,7 +90,7 @@ pub fn view<'a>(
         return None;
     }
 
-    let panel_content = build_settings_content(models, selected_idx, downloading_model, model_status, language, language_options);
+    let panel_content = build_settings_content(models, selected_idx, downloading_model, model_status, language, language_options, backend_ready);
     let panel = Container::new(panel_content)
         .width(500)
         .height(Length::Shrink)
@@ -139,6 +140,7 @@ fn build_model_list<'a>(
     selected_idx: usize,
     downloading_model: Option<usize>,
     model_status: &'a ModelStatus,
+    backend_ready: bool,
 ) -> Element<'a, Message> {
     if models.is_empty() {
         return Container::new(
@@ -171,8 +173,14 @@ fn build_model_list<'a>(
                 format!("  {} ({:.1}MB)", model.name, model.size_bytes as f64 / 1_000_000.0)
             };
 
-            let right_side: Element<'a, Message> = if downloaded {
-                Text::new("[\u{2713}]").into()
+            let right_side: Element<'a, Message> = if downloaded && is_selected && !backend_ready && !is_downloading {
+                button(Text::new("Load").size(12))
+                    .on_press(Message::LoadModel(i))
+                    .into()
+            } else if downloaded && is_selected && backend_ready && !is_downloading {
+                Text::new("\u{2713}").color(iced::Color { r: 0.3, g: 0.8, b: 0.3, a: 1.0 }).into()
+            } else if downloaded && !is_selected && !is_downloading {
+                Text::new("\u{2713}").color(iced::Color { r: 0.3, g: 0.8, b: 0.3, a: 1.0 }).into()
             } else if is_downloading {
                 let pct = progress.unwrap_or(0.0);
                 let filled = (pct / 10.0) as usize;
@@ -185,18 +193,19 @@ fn build_model_list<'a>(
                     .into()
             };
 
-            let row: Element<'a, Message> = if downloaded {
+            let label_elem: Element<'a, Message> = button(Text::new(label).size(13))
+                .on_press(Message::ModelSelected(i))
+                .into();
+
+            let row: Element<'a, Message> = if downloaded && is_selected && !backend_ready && !is_downloading {
                 Row::new()
-                    .push(Text::new(label).size(13))
+                    .push(label_elem)
                     .push(right_side)
                     .spacing(12)
                     .into()
             } else {
                 Row::new()
-                    .push(
-                        button(Text::new(label).size(13))
-                            .on_press(Message::ModelSelected(i))
-                    )
+                    .push(label_elem)
                     .push(right_side)
                     .spacing(12)
                     .into()
@@ -240,18 +249,19 @@ fn build_lang_list<'a>(language: &'a str, language_options: &'a [(String, String
     .into()
 }
 
-fn build_status_text(model_status: &ModelStatus) -> Element<'_, Message> {
+fn build_status_text(model_status: &ModelStatus, backend_ready: bool) -> Element<'_, Message> {
     let text = match *model_status {
         ModelStatus::Downloading(pct) => format!("Downloading: {:.1}%", pct),
-        ModelStatus::Ready => "Model loaded".to_string(),
-        ModelStatus::NotDownloaded => "No model selected".to_string(),
+        ModelStatus::Ready if backend_ready => "Model loaded and ready".to_string(),
+        ModelStatus::Ready => "Model downloaded — click Load Model to use".to_string(),
+        ModelStatus::NotDownloaded => "Not downloaded — download a model to get started".to_string(),
         ModelStatus::Error(ref e) => format!("Error: {}", e),
     };
     Text::new(text).size(12).into()
 }
 
-fn build_buttons<'a>() -> Element<'a, Message> {
-    Row::new()
+fn build_buttons<'a>(selected_idx: usize, backend_ready: bool) -> Element<'a, Message> {
+    let mut row = Row::new()
         .push(
             button(Text::new("Save"))
                 .on_press(Message::SaveSettings),
@@ -260,6 +270,18 @@ fn build_buttons<'a>() -> Element<'a, Message> {
             button(Text::new("Cancel"))
                 .on_press(Message::HideSettings),
         )
-        .spacing(16)
-        .into()
+        .spacing(16);
+
+    if backend_ready {
+        row = row.push(
+            Text::new("\u{2713} Model Loaded").color(iced::Color { r: 0.3, g: 0.8, b: 0.3, a: 1.0 }).size(12),
+        );
+    } else {
+        row = row.push(
+            button(Text::new("Load Model"))
+                .on_press(Message::LoadModel(selected_idx)),
+        );
+    }
+
+    row.into()
 }

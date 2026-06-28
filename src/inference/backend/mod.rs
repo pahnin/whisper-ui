@@ -57,6 +57,7 @@ pub trait TranscriptionBackend: Send + 'static {
     fn supported_languages(&self) -> Vec<String>;
     fn language_codes(&self) -> Vec<String>;
     fn is_ready(&self) -> bool;
+    fn accelerator(&self) -> &str;
 }
 
 // ===== Re-exports =====

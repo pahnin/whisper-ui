@@ -1,9 +1,26 @@
+use std::time::Duration;
+
 pub mod app;
 pub mod document;
 pub mod workspace;
 pub mod inference;
 pub mod audio;
 pub mod ui;
+
+fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::Message> {
+    if state.is_recording {
+        iced::Subscription::run(tick_stream)
+    } else {
+        iced::Subscription::none()
+    }
+}
+
+fn tick_stream() -> impl futures_lite::stream::Stream<Item = crate::app::Message> {
+    futures_lite::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        Some((crate::app::Message::PollTrigger, ()))
+    })
+}
 
 fn main() {
     let language_options = {
@@ -31,11 +48,20 @@ fn main() {
         app_state.load_models();
         app_state.language_options = language_options.clone();
 
+        if app_state.selected_model_idx < app_state.models.len() {
+            if app_state.models[app_state.selected_model_idx].downloaded {
+                app_state.model_status = app::ModelStatus::Ready;
+                let _ = app_state.init_backend();
+            }
+        }
+
         let has_downloaded = app_state.models.iter().any(|m| m.downloaded);
         app_state.show_landing = !has_downloaded;
 
         app_state
     };
 
-    let _ = iced::application(boot, crate::app::update, crate::app::view).run();
+    let _ = iced::application(boot, crate::app::update, crate::app::view)
+        .subscription(subscription)
+        .run();
 }

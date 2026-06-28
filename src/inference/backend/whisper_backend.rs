@@ -2,20 +2,64 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperState};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 use super::{BackendError, BackendParams, TranscriptSegment, TranscriptionBackend};
 
 pub struct WhisperBackend {
+    #[allow(dead_code)]
     ctx: WhisperContext,
     state: WhisperState,
     language: Option<String>,
+    pub accelerator: String,
+    /// Text accumulated across chunk boundaries for context preservation.
+    accumulated_text: String,
 }
 
 impl WhisperBackend {
     pub fn new(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
-        eprintln!("[WHISPER] Model loaded: {:?}", model_path);
-        let whisper_params = whisper_rs::WhisperContextParameters::default();
+        whisper_rs::install_logging_hooks();
+
+        let gpu_params = WhisperContextParameters::default();
+        let ctx = WhisperContext::new_with_params(&model_path, gpu_params);
+
+        let (ctx, accelerator) = match ctx {
+            Ok(ctx) => {
+                eprintln!("[WHISPER] Loaded model with GPU acceleration");
+                (ctx, "GPU".to_string())
+            }
+            Err(e) => {
+                eprintln!("[WHISPER] GPU init failed ({}), falling back to CPU", e);
+                let cpu_params = WhisperContextParameters {
+                    use_gpu: false,
+                    ..WhisperContextParameters::default()
+                };
+                let ctx = WhisperContext::new_with_params(&model_path, cpu_params)
+                    .map_err(|e| BackendError::Internal(format!("Failed to load model (CPU): {}", e)))?;
+                eprintln!("[WHISPER] Loaded model with CPU fallback");
+                (ctx, "CPU".to_string())
+            }
+        };
+
+        let state = ctx
+            .create_state()
+            .map_err(|e| BackendError::Internal(format!("Failed to init state: {}", e)))?;
+
+        Ok(Self {
+            ctx,
+            state,
+            language: params.language,
+            accelerator,
+            accumulated_text: String::new(),
+        })
+    }
+
+    pub fn new_cpu(model_path: PathBuf, params: BackendParams) -> Result<Self, BackendError> {
+        whisper_rs::install_logging_hooks();
+        let whisper_params = WhisperContextParameters {
+            use_gpu: false,
+            ..WhisperContextParameters::default()
+        };
         let ctx = WhisperContext::new_with_params(&model_path, whisper_params)
             .map_err(|e| BackendError::Internal(format!("Failed to load model: {}", e)))?;
         let state = ctx
@@ -25,12 +69,15 @@ impl WhisperBackend {
             ctx,
             state,
             language: params.language,
+            accelerator: "CPU".to_string(),
+            accumulated_text: String::new(),
         })
     }
 
-    /// Synchronous transcription using WhisperState::full() convenience method.
-    /// The same WhisperState instance is reused across calls — no reset needed.
-    /// pcm_to_mel() on a fresh params call clears internal buffers automatically.
+    /// Synchronous transcription with context preservation.
+    /// Uses single-segment mode and text context from previous calls to maintain
+    /// coherence across chunk boundaries. The accumulated_text field carries
+    /// previously transcribed text as a decoder prompt.
     pub fn transcribe_segment_sync(
         &mut self,
         audio_data: &[f32],
@@ -47,29 +94,66 @@ impl WhisperBackend {
         let mut params = FullParams::new(strategy);
         params.set_language(self.language.as_deref());
         params.set_n_threads(4);
+        // Single segment mode prevents Whisper from splitting one chunk into
+        // multiple fragments, which causes text duplication across calls.
+        params.set_single_segment(true);
+        // Preserve text context: feed previous transcription as decoder prompt
+        // so the model knows what has already been said.
+        params.set_no_context(false);
+        // Set initial prompt from accumulated text (truncated to reasonable length).
+        if !self.accumulated_text.is_empty() {
+            let prompt = if self.accumulated_text.len() > 200 {
+                &self.accumulated_text[self.accumulated_text.len() - 200..]
+            } else {
+                &self.accumulated_text
+            };
+            params.set_initial_prompt(prompt);
+        }
 
         self.state
             .full(params, audio_data)
             .map_err(|e| BackendError::TranscriptionFailed(format!("full: {}", e)))?;
 
-        let mut full_text = String::new();
+        // Collect segments — with single-segment mode there should be at most one
+        let mut all_text = String::new();
+        let mut segments_found: Vec<String> = Vec::new();
         for segment in self.state.as_iter() {
             let text = segment.to_str_lossy().unwrap_or_default();
             if !text.is_empty() {
-                let start_ms = segment.start_timestamp();
-                let end_ms = segment.end_timestamp();
-                let start = format!("{:}:{:02}", start_ms / 60000, (start_ms % 60000) / 1000);
-                let end = format!("{:}:{:02}", end_ms / 60000, (end_ms % 60000) / 1000);
-                eprintln!("[WHISPER] [{}-{}] {}", start, end, text.trim());
-                if !full_text.is_empty() {
-                    full_text.push('\n');
+                let trimmed = text.trim().to_string();
+                segments_found.push(trimmed.clone());
+                if !all_text.is_empty() {
+                    all_text.push(' ');
                 }
-                full_text.push_str(&text);
+                all_text.push_str(&trimmed);
             }
         }
 
+        // Update accumulated text with newly transcribed content
+        if !all_text.is_empty() {
+            if !self.accumulated_text.is_empty() && !all_text.is_empty() {
+                // Avoid duplicating text: check if the new text starts with the end of accumulated
+                let last_chars = if self.accumulated_text.len() > 30 {
+                    &self.accumulated_text[self.accumulated_text.len() - 30..]
+                } else {
+                    &self.accumulated_text
+                };
+                if !all_text.starts_with(last_chars) {
+                    self.accumulated_text.push(' ');
+                    self.accumulated_text.push_str(&all_text);
+                }
+            } else if !self.accumulated_text.is_empty() {
+                self.accumulated_text.push(' ');
+                self.accumulated_text.push_str(&all_text);
+            } else {
+                self.accumulated_text = all_text.clone();
+            }
+        }
+
+        eprintln!("[WHISPER] {}", all_text);
+
         let segment = TranscriptSegment {
-            text: full_text,
+            text: all_text,
             start: Duration::ZERO,
             end: Duration::ZERO,
         };
@@ -115,5 +199,9 @@ impl TranscriptionBackend for WhisperBackend {
 
     fn is_ready(&self) -> bool {
         true
+    }
+
+    fn accelerator(&self) -> &str {
+        &self.accelerator
     }
 }
