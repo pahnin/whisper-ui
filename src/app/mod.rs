@@ -362,13 +362,15 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 let _ = state.workspace.save(id);
             }
             let _ = state.workspace.save_all_forced();
-            state.result_tx.take();
             if let Some(mut audio) = state.audio_capture.take() {
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
-            state.worker_handle.take();
-            state.poll_results();
+            if let Some(handle) = state.worker_handle.take() {
+                let _ = handle.join();
+                state.poll_results();
+            }
+            state.result_tx.take();
             if state.selected_model_idx < state.models.len()
                 && state.models[state.selected_model_idx].downloaded {
                 let _ = state.init_backend();

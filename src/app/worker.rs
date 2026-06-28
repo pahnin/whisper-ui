@@ -167,8 +167,16 @@ pub fn run_worker(
                 };
 
                 if !segment.text.is_empty() {
-                    if let Err(TrySendError::Full(_)) = result_tx.try_send(TranscriptionResult::Segment(segment.text)) {
-                        continue;
+                    match result_tx.try_send(TranscriptionResult::Segment(segment.text)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            eprintln!("[WORKER] Result channel full, skipping segment");
+                            continue;
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            eprintln!("[WORKER] Result channel disconnected, stopping worker");
+                            break;
+                        }
                     }
                 }
                 stats.chunks_transcribed += 1;
