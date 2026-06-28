@@ -1,8 +1,35 @@
 use iced::widget::{button, column, Column, Container, Scrollable, Text, TextInput};
+use iced::widget::container;
 use iced::{Element, Length};
 
 use crate::app::Message;
 use crate::workspace::Workspace;
+
+fn sidebar_style() -> impl Fn(&iced::Theme) -> container::Style {
+    |_: &iced::Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.12,
+                g: 0.12,
+                b: 0.14,
+                a: 1.0,
+            })),
+            border: iced::Border {
+                radius: 0.0.into(),
+                width: 1.0,
+                color: iced::Color {
+                    r: 0.2,
+                    g: 0.2,
+                    b: 0.25,
+                    a: 1.0,
+                },
+            },
+            shadow: iced::Shadow::default(),
+            snap: false,
+            text_color: Some(iced::Color::WHITE),
+        }
+    }
+}
 
 pub fn view<'a>(
     workspace: &'a Workspace,
@@ -68,5 +95,6 @@ pub fn view<'a>(
 
     Container::new(sidebar_content)
         .width(250)
+        .style(sidebar_style())
         .into()
 }

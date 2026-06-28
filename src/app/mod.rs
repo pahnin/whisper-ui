@@ -1,9 +1,21 @@
 use std::fs;
+use std::sync::OnceLock;
 
 use iced::widget::{button, Column, Container, Row, Text};
 use iced::{Element, Length, Task};
 
 use crate::audio::capture::AudioCapture;
+
+static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn get_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    TOKIO_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+    })
+}
 use crate::inference::backend::whisper_backend::WhisperBackend;
 use crate::inference::backend::model_manager::ModelInfo;
 use crate::workspace::Workspace;
@@ -60,6 +72,7 @@ pub struct AppState {
     pub models: Vec<ModelInfo>,
     pub model_status: ModelStatus,
     pub language: String,
+    pub language_options: Vec<(String, String)>,
     pub result_rx: Option<std::sync::mpsc::Receiver<TranscriptionResult>>,
     pub level_rx: Option<std::sync::mpsc::Receiver<f32>>,
     pub progress_rx: Option<std::sync::mpsc::Receiver<f32>>,
@@ -100,6 +113,7 @@ impl Default for AppState {
             append_mode: false,
             show_landing: false,
             last_save_time: None,
+            language_options: Vec::new(),
         }
     }
 }
@@ -399,15 +413,13 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 .map(|h| std::path::PathBuf::from(h).join(".cache/whisper-app/models"))
                 .unwrap_or_else(|_| std::path::PathBuf::from(".cache/whisper-app/models"));
             let manager = crate::inference::backend::model_manager::ModelManager::new(cache_dir);
-            return Task::perform(
-                async move {
-                    match manager.download(idx, progress).await {
-                        Ok(_) => Message::ModelDownloadComplete,
-                        Err(e) => Message::ModelDownloadError(e),
-                    }
-                },
-                |msg| msg,
-            );
+            let rt = get_tokio_runtime();
+            return Task::perform(async move {
+                match rt.block_on(async { manager.download(idx, progress).await }) {
+                    Ok(_) => Message::ModelDownloadComplete,
+                    Err(e) => Message::ModelDownloadError(e),
+                }
+            }, |msg| msg);
         }
         Message::InitBackend => {
             if let Err(e) = state.init_backend() {
@@ -599,6 +611,8 @@ pub fn view<'a>(
         &state.model_status,
         state.is_backend_ready(),
         state.downloading_model,
+        state.error_message.as_deref(),
+        &state.language_options,
     );
 
     let main_content = Column::new()
@@ -610,7 +624,8 @@ pub fn view<'a>(
                 .width(Length::Fill),
         )
         .push(controls)
-        .height(Length::Fill);
+        .height(Length::Fill)
+        .width(Length::Fill);
 
     let with_landing = if let Some(overlay) = landing_overlay {
         Container::new(iced::widget::stack![main_content, overlay]).into()
@@ -628,7 +643,10 @@ pub fn view<'a>(
     };
 
     if let Some(settings_elem) = settings {
-        Container::new(iced::widget::stack![with_error, settings_elem]).into()
+        Column::new()
+            .push(with_error)
+            .push(settings_elem)
+            .into()
     } else {
         with_error
     }

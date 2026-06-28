@@ -1,9 +1,27 @@
 use iced::widget::{button, Column, Container, Scrollable, Text, TextInput};
+use iced::widget::container;
 use iced::widget::rule;
 use iced::{Element, Length};
 
 use crate::document::Document;
 use crate::app::Message;
+
+fn editor_style() -> impl Fn(&iced::Theme) -> container::Style {
+    |_: &iced::Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.09,
+                g: 0.09,
+                b: 0.11,
+                a: 1.0,
+            })),
+            border: iced::Border::default(),
+            shadow: iced::Shadow::default(),
+            snap: false,
+            text_color: Some(iced::Color::WHITE),
+        }
+    }
+}
 
 pub fn view<'a>(
     active_doc: Option<&'a Document>,
@@ -80,5 +98,6 @@ pub fn view<'a>(
     Container::new(main_content)
         .width(Length::Fill)
         .height(Length::Fill)
+        .style(editor_style())
         .into()
 }

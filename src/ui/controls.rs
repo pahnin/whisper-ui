@@ -1,7 +1,34 @@
 use iced::widget::{button, Container, Row, Text};
+use iced::widget::container;
 use iced::Length;
 
 use crate::app::Message;
+
+fn controls_style() -> impl Fn(&iced::Theme) -> container::Style {
+    |_: &iced::Theme| {
+        container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                r: 0.12,
+                g: 0.12,
+                b: 0.14,
+                a: 1.0,
+            })),
+            border: iced::Border {
+                radius: 0.0.into(),
+                width: 1.0,
+                color: iced::Color {
+                    r: 0.2,
+                    g: 0.2,
+                    b: 0.25,
+                    a: 1.0,
+                },
+            },
+            shadow: iced::Shadow::default(),
+            snap: false,
+            text_color: Some(iced::Color::WHITE),
+        }
+    }
+}
 
 pub fn view<'a>(
     is_recording: bool,
@@ -45,5 +72,6 @@ pub fn view<'a>(
     Container::new(bottom_bar)
         .width(Length::Fill)
         .height(50)
+        .style(controls_style())
         .into()
 }
