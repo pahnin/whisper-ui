@@ -97,7 +97,7 @@ pub fn view<'a>(
             Message::StartRecord
         })
         .style(button_style(is_recording_active))
-        .padding([3.0, 18.0]);
+        .padding([5.0, 18.0]);
 
     let acc_text = if let Some(acc) = accelerator {
         format!("[{}]", acc)
@@ -202,7 +202,7 @@ pub fn view<'a>(
 
     Container::new(bottom_bar)
         .width(Length::Fill)
-        .height(40)
+        .height(50)
         .style(controls_style())
         .into()
 }

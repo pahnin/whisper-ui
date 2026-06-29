@@ -23,6 +23,8 @@ fn subscription(state: &crate::app::AppState) -> iced::Subscription<crate::app::
 }
 
 fn main() {
+    let _ = env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("warn"));
+
     let language_options = crate::inference::backend::model_manager::ModelManager::language_options();
 
     let boot = move || {

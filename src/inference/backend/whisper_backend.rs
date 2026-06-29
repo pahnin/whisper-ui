@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use log;
+
 use async_trait::async_trait;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
@@ -162,9 +164,7 @@ impl WhisperBackend {
             });
         }
 
-        if std::env::var("WHISPER_DEBUG").is_ok() {
-            eprintln!("[WHISPER CHUNK] {} samples ({:.2}s)", audio_data.len(), audio_data.len() as f64 / 16000.0);
-        }
+        log::debug!("[WHISPER CHUNK] {} samples ({:.2}s)", audio_data.len(), audio_data.len() as f64 / 16000.0);
 
         let strategy = SamplingStrategy::Greedy { best_of: 1 };
         let mut params = FullParams::new(strategy);
@@ -181,9 +181,7 @@ impl WhisperBackend {
             } else {
                 &self.accumulated_text
             };
-            if std::env::var("WHISPER_DEBUG").is_ok() {
-                eprintln!("[WHISPER PROMPT] '{}'", prompt);
-            }
+            log::debug!("[WHISPER PROMPT] '{}'", prompt);
             params.set_initial_prompt(prompt);
         }
 
@@ -200,9 +198,7 @@ impl WhisperBackend {
         let mut all_text = String::new();
         for segment in self.state.as_iter() {
             let text = segment.to_str_lossy().map_err(|e| BackendError::TranscriptionFailed(format!("segment to_str_lossy: {}", e)))?;
-            if std::env::var("WHISPER_DEBUG").is_ok() {
-                eprintln!("[WHISPER RAW] '{}'", text.trim());
-            }
+            log::debug!("[WHISPER RAW] '{}'", text.trim());
             if !text.is_empty() {
                 let trimmed = text.trim().to_string();
                 if !all_text.is_empty() {
@@ -229,9 +225,7 @@ impl WhisperBackend {
                 self.accumulated_text.push_str(trimmed_new);
             }
             
-           if std::env::var("WHISPER_DEBUG").is_ok() {
-                eprintln!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
-            }
+            log::debug!("[WHISPER ACCUMULATED] '{}'", self.accumulated_text.trim());
         }
 
         if self.accumulated_text.len() > 2048 {
@@ -246,9 +240,7 @@ impl WhisperBackend {
         }
 
         if !all_text.is_empty() {
-            if std::env::var("WHISPER_DEBUG").is_ok() {
-                eprintln!("[WHISPER] {}", all_text);
-            }
+            log::debug!("[WHISPER RESULT] {}", all_text);
         }
 
         let segment = TranscriptSegment {
