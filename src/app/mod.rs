@@ -24,6 +24,7 @@ pub enum Message {
     DeleteDocument(uuid::Uuid),
     StartRecord,
     StopRecord,
+    StopComplete { backend_ready: bool },
     ResumeRecord,
     ShowSettings,
     HideSettings,
@@ -60,6 +61,7 @@ pub struct AppState {
     pub download_thread_handle: Option<std::thread::JoinHandle<()>>,
     pub is_recording: bool,
     pub is_paused: bool,
+    pub is_stopping: bool,
     pub audio_level: f32,
     pub show_settings: bool,
     pub selected_model_idx: usize,
@@ -95,6 +97,7 @@ impl Default for AppState {
             download_thread_handle: None,
             is_recording: false,
             is_paused: false,
+            is_stopping: false,
             audio_level: 0.0,
             show_settings: false,
             selected_model_idx: 1,
@@ -359,23 +362,57 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StopRecord => {
+            if state.is_stopping {
+                return Task::none();
+            }
+            if state.downloading_model.is_some() {
+                state.error_message = Some("Cannot stop recording while a model is downloading".to_string());
+                return Task::none();
+            }
+
             state.is_recording = false;
             state.is_paused = false;
+            state.is_stopping = true;
+
+            // Save documents (non-blocking, already fast)
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
             let _ = state.workspace.save_all_forced();
-            if let Some(mut audio) = state.audio_capture.take() {
+
+            // Signal audio to stop (non-blocking — sets AtomicBool, drops stream)
+            if let Some(ref mut audio) = state.audio_capture {
                 audio.stop();
-                state.audio_capture = Some(audio);
             }
-            if let Some(handle) = state.worker_handle.take() {
-                let _ = handle.join();
-                state.poll_results();
-            }
+
+            // Offload blocking work: worker thread join + backend re-init
+            let worker_handle = state.worker_handle.take();
+            let selected_model_idx = state.selected_model_idx;
+            let models = state.models.clone();
+            
+            return Task::perform(
+                async move {
+                    // Wait for worker thread to exit (blocks, but on background thread)
+                    if let Some(handle) = worker_handle {
+                        let _ = handle.join();
+                    }
+                    
+                    let backend_ready = selected_model_idx < models.len() 
+                        && models[selected_model_idx].downloaded;
+                    
+                    Message::StopComplete { backend_ready }
+                },
+                |msg| msg,
+            );
+        }
+
+        Message::StopComplete { backend_ready } => {
+            state.is_stopping = false;
             state.result_tx.take();
-            if state.selected_model_idx < state.models.len()
-                && state.models[state.selected_model_idx].downloaded {
+            state.poll_results();
+            
+            // Re-initialize backend on UI thread (needed since it accesses AppState)
+            if backend_ready && state.selected_model_idx < state.models.len() {
                 let _ = state.init_backend();
             }
         }
@@ -625,6 +662,7 @@ pub fn view<'a>(
     let editor = crate::ui::editor::view(active_doc);
     let controls = crate::ui::controls::view(
         state.is_recording,
+        state.is_stopping,
         state.is_paused,
         state.audio_level,
         state.model_loaded,
