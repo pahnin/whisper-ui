@@ -47,6 +47,7 @@ pub enum Message {
     HideLanding,
     LanguageSearch(String),
     SaveComplete,
+    HoverDoc(Option<uuid::Uuid>),
 }
 
 pub struct AppState {
@@ -79,6 +80,7 @@ pub struct AppState {
     pub show_landing: bool,
     pub language_search: String,
     pub accelerator: Option<String>,
+    pub hovered_doc: Option<uuid::Uuid>,
 }
 
 impl Default for AppState {
@@ -114,6 +116,7 @@ impl Default for AppState {
             language_search: String::new(),
             language_options: Vec::new(),
             accelerator: None,
+            hovered_doc: None,
         }
     }
 }
@@ -534,6 +537,9 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.show_landing = false;
         }
         Message::SaveComplete => {}
+        Message::HoverDoc(doc) => {
+            state.hovered_doc = doc;
+        }
     }
     Task::none()
 }
@@ -613,6 +619,7 @@ pub fn view<'a>(
         state.active_id,
         state.rename_doc,
         &state.rename_input,
+        state.hovered_doc,
     );
     let active_doc = state.workspace.active();
     let editor = crate::ui::editor::view(active_doc);
