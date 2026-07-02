@@ -6,17 +6,9 @@ use crate::app::Message;
 
 fn button_style(
     is_recording: bool,
-    is_stopping: bool,
 ) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
     move |_: &iced::Theme, _status| {
-        let bg = if is_stopping {
-            iced::Color {
-                r: 0.42,
-                g: 0.42,
-                b: 0.48,
-                a: 1.0,
-            }
-        } else if is_recording {
+        let bg = if is_recording {
             iced::Color {
                 r: 0.85,
                 g: 0.30,
@@ -79,16 +71,16 @@ fn controls_style() -> impl Fn(&iced::Theme) -> container::Style {
 
 pub fn view<'a>(
     is_recording: bool,
-    is_stopping: bool,
     is_paused: bool,
+    is_stopping: bool,
     _audio_level: f32,
     model_loaded: bool,
     accelerator: Option<&'a str>,
 ) -> iced::Element<'a, Message> {
-    let rec_text = if !model_loaded {
+    let rec_text = if is_stopping {
+        "Processing"
+    } else if !model_loaded {
         "Record"
-    } else if is_stopping {
-        "Stopping..."
     } else if is_recording && !is_paused {
         "Stop"
     } else if is_paused {
@@ -100,15 +92,17 @@ pub fn view<'a>(
     let is_recording_active = is_recording && !is_paused;
 
     let rec_btn = button(Text::new(rec_text).size(12))
-        .on_press(if is_stopping || !model_loaded || is_recording_active {
+        .on_press(if is_stopping {
+            Message::StopRecord
+        } else if !model_loaded || is_recording_active {
             Message::StopRecord
         } else if is_paused {
             Message::ResumeRecord
         } else {
             Message::StartRecord
         })
-        .style(button_style(is_recording_active, is_stopping))
-        .padding([5.0, 18.0]);
+        .style(button_style(is_stopping || is_recording_active))
+        .padding([6.0, 18.0]);
 
     let acc_text = if let Some(acc) = accelerator {
         format!("[{}]", acc)
@@ -116,14 +110,7 @@ pub fn view<'a>(
         String::new()
     };
 
-    let indicator_color = if is_stopping {
-        iced::Color {
-            r: 0.42,
-            g: 0.42,
-            b: 0.48,
-            a: 1.0,
-        }
-    } else if is_recording_active {
+    let indicator_color = if is_recording_active {
         iced::Color {
             r: 0.85,
             g: 0.30,
@@ -163,16 +150,7 @@ pub fn view<'a>(
             text_color: None,
         });
 
-    let status_text = if is_stopping {
-        Text::new("Stopping")
-            .size(11)
-            .color(iced::Color {
-                r: 0.42,
-                g: 0.42,
-                b: 0.48,
-                a: 1.0,
-            })
-    } else if !model_loaded {
+    let status_text = if !model_loaded {
         Text::new("No model loaded")
             .size(11)
             .color(iced::Color {

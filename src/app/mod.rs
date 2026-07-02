@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use iced::widget::{button, Column, Container, Row, Text};
 use iced::{Element, Length, Task};
 
-use crate::audio::capture::AudioCapture;
+use crate::audio::capture::{AudioCapture, AudioCaptureError};
 use crate::config;
 use crate::document::TranscriptLine;
 use crate::inference::backend::whisper_backend::WhisperBackend;
@@ -24,7 +24,6 @@ pub enum Message {
     DeleteDocument(uuid::Uuid),
     StartRecord,
     StopRecord,
-    StopComplete { backend_ready: bool },
     ResumeRecord,
     ShowSettings,
     HideSettings,
@@ -172,10 +171,9 @@ impl AppState {
         }
     }
 
-    pub fn init_audio(&mut self) -> Result<(), String> {
+    pub fn init_audio(&mut self) -> Result<(), AudioCaptureError> {
         let (level_tx, level_rx) = std::sync::mpsc::channel();
-        let audio = AudioCapture::new(level_tx)
-            .map_err(|e| format!("Failed to create audio capture: {}", e))?;
+        let audio = AudioCapture::new(level_tx)?;
         self.audio_capture = Some(audio);
         self.level_rx = Some(level_rx);
         Ok(())
@@ -323,7 +321,7 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             if state.audio_capture.is_none() {
                 if let Err(e) = state.init_audio() {
                     eprintln!("[APP] Failed to init audio: {}", e);
-                    state.error_message = Some(e);
+                    state.error_message = Some(format!("Failed to init audio: {}", e));
                     state.is_recording = false;
                     return Task::none();
                 }
@@ -362,57 +360,25 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
 
         Message::StopRecord => {
-            if state.is_stopping {
-                return Task::none();
-            }
-            if state.downloading_model.is_some() {
-                state.error_message = Some("Cannot stop recording while a model is downloading".to_string());
-                return Task::none();
-            }
-
             state.is_recording = false;
             state.is_paused = false;
             state.is_stopping = true;
-
-            // Save documents (non-blocking, already fast)
             if let Some(id) = state.active_id {
                 let _ = state.workspace.save(id);
             }
             let _ = state.workspace.save_all_forced();
-
-            // Signal audio to stop (non-blocking — sets AtomicBool, drops stream)
-            if let Some(ref mut audio) = state.audio_capture {
+            if let Some(mut audio) = state.audio_capture.take() {
                 audio.stop();
+                state.audio_capture = Some(audio);
             }
-
-            // Offload blocking work: worker thread join + backend re-init
-            let worker_handle = state.worker_handle.take();
-            let selected_model_idx = state.selected_model_idx;
-            let models = state.models.clone();
-            
-            return Task::perform(
-                async move {
-                    // Wait for worker thread to exit (blocks, but on background thread)
-                    if let Some(handle) = worker_handle {
-                        let _ = handle.join();
-                    }
-                    
-                    let backend_ready = selected_model_idx < models.len() 
-                        && models[selected_model_idx].downloaded;
-                    
-                    Message::StopComplete { backend_ready }
-                },
-                |msg| msg,
-            );
-        }
-
-        Message::StopComplete { backend_ready } => {
+            if let Some(handle) = state.worker_handle.take() {
+                let _ = handle.join();
+                state.poll_results();
+            }
             state.is_stopping = false;
             state.result_tx.take();
-            state.poll_results();
-            
-            // Re-initialize backend on UI thread (needed since it accesses AppState)
-            if backend_ready && state.selected_model_idx < state.models.len() {
+            if state.selected_model_idx < state.models.len()
+                && state.models[state.selected_model_idx].downloaded {
                 let _ = state.init_backend();
             }
         }
@@ -662,8 +628,8 @@ pub fn view<'a>(
     let editor = crate::ui::editor::view(active_doc);
     let controls = crate::ui::controls::view(
         state.is_recording,
-        state.is_stopping,
         state.is_paused,
+        state.is_stopping,
         state.audio_level,
         state.model_loaded,
         state.accelerator.as_deref(),

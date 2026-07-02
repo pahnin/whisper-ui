@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
@@ -41,9 +41,9 @@ fn find_supported_config(
     let sample_rate = {
         let min_rate = best.min_sample_rate();
         let max_rate = best.max_sample_rate();
-        if target_rate >= min_rate.0 && target_rate <= max_rate.0 {
-            cpal::SampleRate(target_rate)
-        } else if target_rate < min_rate.0 {
+        if target_rate >= min_rate && target_rate <= max_rate {
+            target_rate
+        } else if target_rate < min_rate {
             min_rate
         } else {
             max_rate
@@ -91,8 +91,8 @@ fn score_config(
     target_rate: u32,
     target_channels: u16,
 ) -> u64 {
-    let sample_rate = config.min_sample_rate().0.max(
-        config.max_sample_rate().0.min(target_rate),
+    let sample_rate = config.min_sample_rate().max(
+        config.max_sample_rate().min(target_rate),
     );
     let rate_diff = (sample_rate as i64 - target_rate as i64).unsigned_abs();
     let rate_score = 1000u64.saturating_sub(rate_diff as u64);
@@ -108,6 +108,32 @@ fn build_ring_buffer_capacity(sample_rate: u32, _channels: u16, seconds: usize) 
     sample_rate as usize * seconds
 }
 
+/// Check if a cpal Error indicates a permission denial (e.g., macOS microphone permission).
+pub fn is_permission_error(err: &cpal::Error) -> bool {
+    err.kind() == cpal::ErrorKind::PermissionDenied
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AudioCaptureError {
+    #[error("no default input device found")]
+    NoDefaultInputDevice,
+
+    #[error("microphone access denied — please grant permission in System Settings > Privacy & Security > Microphone")]
+    PermissionDenied,
+
+    #[error("{0}")]
+    BuildStream(String),
+
+    #[error("unsupported sample format: {0}")]
+    UnsupportedSampleFormat(String),
+}
+
+impl From<String> for AudioCaptureError {
+    fn from(s: String) -> Self {
+        AudioCaptureError::BuildStream(s)
+    }
+}
+
 pub struct AudioCapture {
     pub sample_rate: u32,
     device_config: DeviceConfig,
@@ -118,18 +144,18 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    pub fn new(level_tx: Sender<f32>) -> Result<Self, String> {
+    pub fn new(level_tx: Sender<f32>) -> Result<Self, AudioCaptureError> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
-            .ok_or("No default input device found".to_string())?;
+            .ok_or(AudioCaptureError::NoDefaultInputDevice)?;
 
         let device_config = find_supported_config(&device, TARGET_SAMPLE_RATE, TARGET_CHANNELS)
-            .ok_or_else(|| "No supported audio input config found".to_string())?;
+            .ok_or_else(|| AudioCaptureError::BuildStream("No supported audio input config found".to_string()))?;
 
         let capacity =
             build_ring_buffer_capacity(
-                device_config.stream_config.sample_rate.0,
+                device_config.stream_config.sample_rate,
                 device_config.stream_config.channels,
                 RING_BUFFER_SECONDS,
             );
@@ -137,7 +163,7 @@ impl AudioCapture {
             Arc::new(crossbeam_queue::ArrayQueue::new(capacity));
 
         Ok(Self {
-            sample_rate: device_config.stream_config.sample_rate.0,
+            sample_rate: device_config.stream_config.sample_rate,
             device_config,
             ring_buffer,
             running: Arc::new(AtomicBool::new(false)),
@@ -146,7 +172,7 @@ impl AudioCapture {
         })
     }
 
-    pub fn start(&mut self) -> Result<(), String> {
+    pub fn start(&mut self) -> Result<(), AudioCaptureError> {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -159,15 +185,15 @@ impl AudioCapture {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
-            .ok_or("No default input device found".to_string())?;
+            .ok_or(AudioCaptureError::NoDefaultInputDevice)?;
         let level_tx = self.level_tx.clone();
 
         let err_fn = move |err| eprintln!("audio error: {}", err);
 
-        match sample_format {
+        let stream = match sample_format {
             SampleFormat::F32 => {
-                let stream = device.build_input_stream::<f32, _, _>(
-                    &config,
+                device.build_input_stream::<f32, _, _>(
+                    config,
                     move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                         if !data.is_empty() {
                             for &value in data {
@@ -182,14 +208,11 @@ impl AudioCapture {
                     },
                     err_fn,
                     Some(Duration::from_secs(1)),
-                );
-
-                let stream = stream.map_err(|e| format!("Failed to build input stream: {}", e))?;
-                self.stream_handle = Some(stream);
+                )
             }
             SampleFormat::I16 => {
-                let stream = device.build_input_stream::<i16, _, _>(
-                    &config,
+                device.build_input_stream::<i16, _, _>(
+                    config,
                     move |data: &[i16], _info: &cpal::InputCallbackInfo| {
                         if !data.is_empty() {
                             for &value in data {
@@ -205,20 +228,41 @@ impl AudioCapture {
                     },
                     err_fn,
                     Some(Duration::from_secs(1)),
-                );
-
-                let stream = stream.map_err(|e| format!("Failed to build input stream: {}", e))?;
-                self.stream_handle = Some(stream);
+                )
             }
             _ => {
-                return Err(format!(
-                    "Unsupported sample format: {:?}",
-                    sample_format
+                return Err(AudioCaptureError::UnsupportedSampleFormat(
+                    sample_format.to_string(),
                 ));
             }
-        }
+        };
 
-        Ok(())
+        match stream {
+            Ok(s) => {
+                if let Err(e) = s.play() {
+                    if is_permission_error(&e) {
+                        return Err(AudioCaptureError::PermissionDenied);
+                    } else {
+                        return Err(AudioCaptureError::BuildStream(format!(
+                            "Failed to play input stream: {}",
+                            e
+                        )));
+                    }
+                }
+                self.stream_handle = Some(s);
+                Ok(())
+            }
+            Err(e) => {
+                if is_permission_error(&e) {
+                    Err(AudioCaptureError::PermissionDenied)
+                } else {
+                    Err(AudioCaptureError::BuildStream(format!(
+                        "Failed to build input stream: {}",
+                        e
+                    )))
+                }
+            }
+        }
     }
 
     pub fn stop(&mut self) {
