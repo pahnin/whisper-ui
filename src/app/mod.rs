@@ -48,6 +48,7 @@ pub enum Message {
     LanguageSearch(String),
     SaveComplete,
     HoverDoc(Option<uuid::Uuid>),
+    WorkerDone,
 }
 
 pub struct AppState {
@@ -57,6 +58,7 @@ pub struct AppState {
     pub audio_capture: Option<AudioCapture>,
     pub backend: Option<WhisperBackend>,
     pub worker_handle: Option<std::thread::JoinHandle<()>>,
+    pub worker_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub download_thread_handle: Option<std::thread::JoinHandle<()>>,
     pub is_recording: bool,
     pub is_paused: bool,
@@ -93,6 +95,7 @@ impl Default for AppState {
             audio_capture: None,
             backend: None,
             worker_handle: None,
+            worker_done_tx: None,
             download_thread_handle: None,
             is_recording: false,
             is_paused: false,
@@ -274,6 +277,7 @@ impl AppState {
         if let Some(handle) = self.download_thread_handle.take() {
             let _ = handle.join();
         }
+        // worker_done_tx is consumed by StopRecord, no need to signal in Drop
     }
 }
 
@@ -342,12 +346,15 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.result_tx = Some(result_tx.clone());
             state.result_rx = Some(result_rx);
 
+            let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel();
+            state.worker_done_tx = Some(worker_done_tx);
+
             match audio.start() {
                 Ok(()) => {
                     let ring_buffer = audio.get_ring_buffer();
                     let running = audio.get_running();
                     let sample_rate = audio.sample_rate;
-                    let handle = worker::run_worker(ring_buffer, backend, result_tx, running, sample_rate);
+                    let handle = worker::run_worker(ring_buffer, backend, result_tx, running, sample_rate, worker_done_rx);
                     state.worker_handle = Some(handle);
                     state.audio_capture = Some(audio);
                 }
@@ -367,14 +374,35 @@ pub fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 let _ = state.workspace.save(id);
             }
             let _ = state.workspace.save_all_forced();
+
+            // Stop audio input (sets running=false, drops stream handle).
+            // Worker thread holds Arc clones of ring_buffer and running,
+            // so they stay alive. AudioCapture is taken so it won't be
+            // dropped until recording restarts.
+            let worker_done_tx = state.worker_done_tx.take();
             if let Some(mut audio) = state.audio_capture.take() {
                 audio.stop();
                 state.audio_capture = Some(audio);
             }
+
+            // Spawn a background task to wait for the worker to finish
+            // processing remaining audio, then reinitialize the backend.
+            return Task::perform(
+                async move {
+                    if let Some(tx) = worker_done_tx {
+                        let _ = tx.send(());
+                    }
+                },
+                |_| Message::WorkerDone,
+            );
+        }
+
+      Message::WorkerDone => {
+            // Worker has finished processing all remaining audio chunks.
             if let Some(handle) = state.worker_handle.take() {
                 let _ = handle.join();
-                state.poll_results();
             }
+            state.worker_done_tx = None;
             state.is_stopping = false;
             state.result_tx.take();
             if state.selected_model_idx < state.models.len()

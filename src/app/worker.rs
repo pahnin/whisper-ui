@@ -70,6 +70,7 @@ pub fn run_worker(
     result_tx: crossbeam_channel::Sender<TranscriptionResult>,
     running: Arc<AtomicBool>,
     device_sample_rate: u32,
+    mut worker_done_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
         let min_samples: usize = (device_sample_rate as usize) * (MIN_AUDIO_SECS as usize);
@@ -88,12 +89,7 @@ pub fn run_worker(
         let (_wake_tx, wake_rx): (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) = std::sync::mpsc::channel();
 
         loop {
-            let running = running.load(Ordering::SeqCst);
-            if !running {
-                break;
-            }
-
-            // Drain available samples from ring buffer
+            // Drain all available samples from ring buffer
             let mut drained: Vec<f32> = Vec::new();
             while let Some(value) = ring_buffer.pop() {
                 drained.push(value);
@@ -106,6 +102,16 @@ pub fn run_worker(
                 if recent_audio.len() > max_samples {
                     recent_audio.drain(..recent_audio.len() - max_samples);
                 }
+            }
+
+            // Check if we should exit (before attempting to process more audio)
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Check if worker was signaled to stop (e.g., user clicked Stop mid-processing)
+            if worker_done_rx.try_recv().is_ok() {
+                break;
             }
 
             // Check if we've accumulated enough audio for a new chunk
