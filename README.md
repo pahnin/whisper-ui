@@ -14,6 +14,8 @@ Almost live transcription on RTX 5060 TI 16 GB with medium model.
 Smaller models are less accurate but are faster in CPU alone, your mileage may vary on your hardware.
 ## Quick Start
 
+Make sure that `cmake` and `cargo` are available 
+
 ```bash
 cd whisper-app
 cargo run
